@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 from dataclasses import dataclass
@@ -55,9 +56,15 @@ class Config:
 
     # Marker detection
     dark_value_max: int = 70
+    local_dark_value_max: int = 135
+    local_dark_delta_min: int = 35
     dark_saturation_max: int = 210
     marker_min_area_fraction: float = 0.018
+    marker_total_area_fraction: float = 0.024
     marker_min_pixels: int = 18
+    marker_line_min_pixels: int = 10
+    marker_line_min_length_fraction: float = 0.16
+    marker_component_contrast_min: float = 32.0
     marker_morph_kernel: int = 3
 
     # Missing-chip / blue-tape exposure detection
@@ -99,8 +106,27 @@ class ChipResult:
     marker_defect: bool
     missing_defect: bool
     marker_fraction: float
+    marker_total_fraction: float
+    marker_largest_pixels: int
+    marker_total_pixels: int
+    marker_line_pixels: int
+    marker_line_length: float
+    marker_contrast: float
     blue_fraction: float
     texture_std: float
+
+
+@dataclass
+class ImageAnalysisSummary:
+    total_chips: int
+    defective_chips: int
+    defect_rate: float
+    marker_defects: int
+    missing_defects: int
+    result_image: str
+    debug_image: str
+    chip_report: str
+    chips: list[dict[str, int | float | bool]]
 
 
 def load_image(path: Path) -> np.ndarray:
@@ -178,7 +204,19 @@ def collect_manual_points(image: np.ndarray, cfg: Config) -> np.ndarray:
         if len(points) >= 2:
             shown_points = np.array([(int(x * scale), int(y * scale)) for x, y in points], dtype=np.int32)
             cv2.polylines(display, [shown_points], len(points) == 4, (0, 255, 255), 2, cv2.LINE_AA)
-        next_text = "完成后按 Enter 确认" if len(points) == 4 else f"请点击：{names[len(points)]}"
+
+        if len(points) == 4:
+            try:
+                _warped, _matrix, inverse, geometry = perspective_from_points(image, np.array(points, dtype=np.float32))
+                preview_cells = generate_chip_cells(geometry, cfg)
+                for cell in preview_cells:
+                    polygon = transform_polygon(cell_polygon(cell), inverse)
+                    shown_polygon = np.round(polygon.astype(np.float32) * scale).astype(np.int32)
+                    cv2.polylines(display, [shown_polygon], True, (255, 255, 0), 1, cv2.LINE_AA)
+            except Exception:
+                pass
+
+        next_text = "确认网格对齐后按 Enter；不对按 R 重选" if len(points) == 4 else f"请点击：{names[len(points)]}"
         draw_text(display, next_text, (20, 18), cfg, size=26, color=(0, 255, 255))
 
     def on_mouse(event, x, y, _flags, _param) -> None:
@@ -323,14 +361,78 @@ def cell_mask(shape: tuple[int, int], cell: ChipCell, scale: float) -> np.ndarra
     return mask
 
 
-def largest_blob_fraction(binary: np.ndarray, sample_mask: np.ndarray) -> tuple[float, int]:
+def marker_component_metrics(
+    binary: np.ndarray,
+    sample_mask: np.ndarray,
+    gray: np.ndarray,
+    cfg: Config,
+) -> dict[str, float | int]:
     masked = cv2.bitwise_and(binary, sample_mask)
     sample_area = max(1, int(cv2.countNonZero(sample_mask)))
     components, labels, stats, _ = cv2.connectedComponentsWithStats(masked, connectivity=8)
     if components <= 1:
-        return 0.0, 0
-    largest = int(np.max(stats[1:, cv2.CC_STAT_AREA]))
-    return largest / sample_area, largest
+        return {
+            "largest_fraction": 0.0,
+            "largest_pixels": 0,
+            "total_fraction": 0.0,
+            "total_pixels": 0,
+            "line_pixels": 0,
+            "line_length": 0.0,
+            "contrast": 0.0,
+        }
+
+    valid_mask = np.zeros(masked.shape, dtype=np.uint8)
+    largest_pixels = 0
+    total_pixels = 0
+    best_line_pixels = 0
+    best_line_length = 0.0
+    best_contrast = 0.0
+    background_values = gray[(sample_mask > 0) & (masked == 0)]
+    background_median = float(np.median(background_values)) if background_values.size else float(np.median(gray[sample_mask > 0]))
+
+    for label in range(1, components):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < cfg.marker_line_min_pixels:
+            continue
+
+        component = labels == label
+        component_values = gray[component]
+        component_mean = float(np.mean(component_values)) if component_values.size else 255.0
+        contrast = background_median - component_mean
+        if contrast < cfg.marker_component_contrast_min:
+            continue
+
+        valid_mask[component] = 255
+        largest_pixels = max(largest_pixels, area)
+        total_pixels += area
+
+        line_length = float(max(w, h))
+        if line_length > best_line_length:
+            best_line_length = line_length
+            best_line_pixels = area
+            best_contrast = contrast
+
+    if cfg.marker_morph_kernel > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.marker_morph_kernel, cfg.marker_morph_kernel))
+        valid_mask = cv2.morphologyEx(valid_mask, cv2.MORPH_CLOSE, kernel)
+        components, labels, stats, _ = cv2.connectedComponentsWithStats(valid_mask, connectivity=8)
+        if components > 1:
+            largest_pixels = int(np.max(stats[1:, cv2.CC_STAT_AREA]))
+            total_pixels = int(np.sum(stats[1:, cv2.CC_STAT_AREA]))
+
+    return {
+        "largest_fraction": largest_pixels / sample_area,
+        "largest_pixels": largest_pixels,
+        "total_fraction": total_pixels / sample_area,
+        "total_pixels": total_pixels,
+        "line_pixels": best_line_pixels,
+        "line_length": best_line_length,
+        "contrast": best_contrast,
+    }
 
 
 def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
@@ -346,20 +448,32 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
         & (v >= cfg.blue_value_min)
     ).astype(np.uint8) * 255
 
-    dark = ((v <= cfg.dark_value_max) & (s <= cfg.dark_saturation_max)).astype(np.uint8) * 255
-    if cfg.marker_morph_kernel > 1:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.marker_morph_kernel, cfg.marker_morph_kernel))
-        dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
-        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
-
-    marker_fraction, marker_pixels = largest_blob_fraction(dark, sample)
     sample_area = max(1, int(cv2.countNonZero(sample)))
     blue_fraction = cv2.countNonZero(cv2.bitwise_and(blue, sample)) / sample_area
 
     values = gray[sample > 0]
     texture_std = float(np.std(values)) if values.size else 0.0
+    local_median_v = float(np.median(v[sample > 0])) if values.size else 0.0
 
-    marker_defect = marker_fraction >= cfg.marker_min_area_fraction and marker_pixels >= cfg.marker_min_pixels
+    absolute_dark = v <= cfg.dark_value_max
+    locally_dark = (v <= cfg.local_dark_value_max) & ((local_median_v - v) >= cfg.local_dark_delta_min)
+    dark = ((absolute_dark | locally_dark) & (s <= cfg.dark_saturation_max)).astype(np.uint8) * 255
+    metrics = marker_component_metrics(dark, sample, gray, cfg)
+
+    marker_fraction = float(metrics["largest_fraction"])
+    marker_pixels = int(metrics["largest_pixels"])
+    marker_total_fraction = float(metrics["total_fraction"])
+    marker_total_pixels = int(metrics["total_pixels"])
+    marker_line_pixels = int(metrics["line_pixels"])
+    marker_line_length = float(metrics["line_length"])
+    marker_contrast = float(metrics["contrast"])
+
+    min_line_length = min(cell.width, cell.height) * cfg.marker_line_min_length_fraction
+    marker_defect = (
+        (marker_fraction >= cfg.marker_min_area_fraction and marker_pixels >= cfg.marker_min_pixels)
+        or marker_total_fraction >= cfg.marker_total_area_fraction
+        or (marker_line_pixels >= cfg.marker_line_min_pixels and marker_line_length >= min_line_length)
+    )
     missing_defect = (
         blue_fraction >= cfg.blue_missing_fraction
         and texture_std <= cfg.low_texture_std_max
@@ -372,6 +486,12 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
         marker_defect=marker_defect,
         missing_defect=missing_defect,
         marker_fraction=marker_fraction,
+        marker_total_fraction=marker_total_fraction,
+        marker_largest_pixels=marker_pixels,
+        marker_total_pixels=marker_total_pixels,
+        marker_line_pixels=marker_line_pixels,
+        marker_line_length=marker_line_length,
+        marker_contrast=marker_contrast,
         blue_fraction=blue_fraction,
         texture_std=texture_std,
     )
@@ -451,6 +571,14 @@ def draw_debug_grid(
         polygon = transform_polygon(cell_polygon(result.cell), cell_to_image)
         cv2.polylines(out, [polygon], True, cfg.grid_color, 1, cv2.LINE_AA)
 
+    manual_points = debug_masks.get("manual_points")
+    if manual_points is not None:
+        labels = ["上", "右", "下", "左"]
+        for label, point in zip(labels, np.asarray(manual_points, dtype=np.float32)):
+            center = tuple(np.round(point).astype(int))
+            cv2.circle(out, center, 12, (0, 0, 255), -1, cv2.LINE_AA)
+            draw_text(out, label, (center[0] + 14, center[1] - 14), cfg, size=28, color=(0, 0, 255))
+
     draw_text(out, f"网格角度：{geometry.angle_deg:.2f} 度", (18, 14), cfg, size=24, color=(255, 220, 100))
     draw_text(out, f"预期芯片数：{TOTAL_EXPECTED_CHIPS}", (18, 46), cfg, size=24, color=(255, 220, 100))
     return out
@@ -485,17 +613,131 @@ def print_summary(results: list[ChipResult]) -> None:
     print(f"缺片缺陷：{missing}")
 
 
+def save_chip_report(path: Path, results: list[ChipResult]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "index",
+        "row",
+        "col",
+        "defective",
+        "marker_defect",
+        "missing_defect",
+        "marker_fraction",
+        "marker_total_fraction",
+        "marker_largest_pixels",
+        "marker_total_pixels",
+        "marker_line_pixels",
+        "marker_line_length",
+        "marker_contrast",
+        "blue_fraction",
+        "texture_std",
+    ]
+    with path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for result in results:
+            writer.writerow(
+                {
+                    "index": result.cell.index,
+                    "row": result.cell.row,
+                    "col": result.cell.col,
+                    "defective": int(result.defective),
+                    "marker_defect": int(result.marker_defect),
+                    "missing_defect": int(result.missing_defect),
+                    "marker_fraction": f"{result.marker_fraction:.6f}",
+                    "marker_total_fraction": f"{result.marker_total_fraction:.6f}",
+                    "marker_largest_pixels": result.marker_largest_pixels,
+                    "marker_total_pixels": result.marker_total_pixels,
+                    "marker_line_pixels": result.marker_line_pixels,
+                    "marker_line_length": f"{result.marker_line_length:.2f}",
+                    "marker_contrast": f"{result.marker_contrast:.2f}",
+                    "blue_fraction": f"{result.blue_fraction:.6f}",
+                    "texture_std": f"{result.texture_std:.2f}",
+                }
+            )
+
+
+def process_image_file(
+    image_path: Path,
+    points: list[list[float]] | np.ndarray,
+    output_dir: Path,
+    cfg: Config | None = None,
+) -> ImageAnalysisSummary:
+    """Analyze one image from a web/API caller without opening manual UI windows."""
+    cfg = cfg or Config()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image = load_image(image_path)
+    point_array = np.array(points, dtype=np.float32)
+    if point_array.shape != (4, 2):
+        raise ValueError("points must contain four [x, y] coordinates")
+
+    results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, point_array, cfg)
+    if len(results) != TOTAL_EXPECTED_CHIPS:
+        raise RuntimeError(f"Expected {TOTAL_EXPECTED_CHIPS} chips, got {len(results)}")
+
+    result_path = output_dir / f"{image_path.stem}_result.png"
+    debug_path = output_dir / f"{image_path.stem}_grid.png"
+    report_path = output_dir / f"{image_path.stem}_chips.csv"
+    annotated = annotate_results(image, results, cfg, cell_to_image=cell_to_image)
+    debug_grid = draw_debug_grid(image, results, geometry, debug_masks, cfg, cell_to_image=cell_to_image)
+    cv2.imwrite(str(result_path), annotated)
+    cv2.imwrite(str(debug_path), debug_grid)
+    write_chip_report(report_path, results)
+
+    total = len(results)
+    defective = sum(r.defective for r in results)
+    marker = sum(r.marker_defect for r in results)
+    missing = sum(r.missing_defect for r in results)
+    chips = [
+        {
+            "index": r.cell.index,
+            "row": r.cell.row,
+            "col": r.cell.col,
+            "defective": r.defective,
+            "marker_defect": r.marker_defect,
+            "missing_defect": r.missing_defect,
+            "marker_fraction": r.marker_fraction,
+            "marker_total_fraction": r.marker_total_fraction,
+            "marker_largest_pixels": r.marker_largest_pixels,
+            "marker_total_pixels": r.marker_total_pixels,
+            "marker_line_pixels": r.marker_line_pixels,
+            "marker_line_length": r.marker_line_length,
+            "marker_contrast": r.marker_contrast,
+            "blue_fraction": r.blue_fraction,
+            "texture_std": r.texture_std,
+        }
+        for r in results
+    ]
+
+    return ImageAnalysisSummary(
+        total_chips=total,
+        defective_chips=defective,
+        defect_rate=defective / total if total else 0.0,
+        marker_defects=marker,
+        missing_defects=missing,
+        result_image=str(result_path),
+        debug_image=str(debug_path),
+        chip_report=str(report_path),
+        chips=chips,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="晶圆缺陷自动计数程序。默认点击上中、右中、下中、左中四颗参考芯片中心进行校准。")
     parser.add_argument("image", type=Path, help="输入晶圆图片。")
     parser.add_argument("--out", type=Path, default=Path("result.png"), help="带缺陷标注的结果图。")
     parser.add_argument("--debug", type=Path, default=Path("debug_grid.png"), help="芯片网格调试图。")
     parser.add_argument("--debug-masks", type=Path, default=None, help="可选：保存额外调试图。")
+    parser.add_argument("--chip-report", type=Path, default=None, help="可选：导出每颗芯片的检测指标 CSV。")
     parser.add_argument("--points", type=Path, default=None, help="读取已保存的四个参考芯片中心点，跳过人工点击。")
     parser.add_argument("--save-points", type=Path, default=None, help="保存本次人工点击的四个参考芯片中心点。")
 
     parser.add_argument("--dark-value-max", type=int, default=None, help="黑色标记亮度阈值，调高可识别更淡笔迹。")
+    parser.add_argument("--local-dark-value-max", type=int, default=None, help="相对背景变暗检测的最高亮度，调高可识别更淡笔迹。")
+    parser.add_argument("--local-dark-delta-min", type=int, default=None, help="相对背景至少变暗多少才算候选墨迹。")
     parser.add_argument("--marker-min-area-fraction", type=float, default=None, help="标记最小面积比例，调高减少误报。")
+    parser.add_argument("--marker-total-area-fraction", type=float, default=None, help="多个小墨迹累计面积比例阈值。")
     parser.add_argument("--blue-missing-fraction", type=float, default=None, help="蓝膜暴露比例阈值，调高减少缺片误报。")
     return parser.parse_args()
 
@@ -506,7 +748,10 @@ def main() -> None:
 
     for arg_name, cfg_name in [
         ("dark_value_max", "dark_value_max"),
+        ("local_dark_value_max", "local_dark_value_max"),
+        ("local_dark_delta_min", "local_dark_delta_min"),
         ("marker_min_area_fraction", "marker_min_area_fraction"),
+        ("marker_total_area_fraction", "marker_total_area_fraction"),
         ("blue_missing_fraction", "blue_missing_fraction"),
     ]:
         value = getattr(args, arg_name)
@@ -532,16 +777,22 @@ def main() -> None:
     annotated = annotate_results(image, results, cfg, cell_to_image=cell_to_image)
     debug_grid = draw_debug_grid(image, results, geometry, debug_masks, cfg, cell_to_image=cell_to_image)
 
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.debug.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(args.out), annotated)
     cv2.imwrite(str(args.debug), debug_grid)
     if args.debug_masks:
         save_matplotlib_debug(args.debug_masks, image, debug_masks)
+    if args.chip_report:
+        save_chip_report(args.chip_report, results)
 
     print_summary(results)
     print(f"已保存结果图：{args.out}")
     print(f"已保存网格调试图：{args.debug}")
     if args.debug_masks:
         print(f"已保存额外调试图：{args.debug_masks}")
+    if args.chip_report:
+        print(f"已保存芯片指标表：{args.chip_report}")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,11 @@ __pycache__/
 *.jpg
 *.jpeg
 *.png
+*.csv
+
+# Local test/output folders
+测试结果/
+web_data/
 
 # Spreadsheet/manual comparison files
 *.xlsx

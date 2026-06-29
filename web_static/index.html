@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>晶圆缺陷计数</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>晶圆缺陷计数</h1>
+      <p>批量上传、手机拍照、四点校准、自动统计</p>
+    </div>
+    <button id="refreshBtn" class="iconButton" title="刷新">↻</button>
+  </header>
+
+  <main class="layout">
+    <section class="panel uploadPanel">
+      <h2>新建批次</h2>
+      <form id="uploadForm">
+        <label class="field">
+          <span>批次名称</span>
+          <input id="batchName" name="name" type="text" placeholder="例如：白班-01">
+        </label>
+        <label class="dropzone" for="fileInput">
+          <input id="fileInput" name="files" type="file" accept="image/*" multiple>
+          <strong>选择一批图片</strong>
+          <span id="fileCount">支持一次上传多张</span>
+        </label>
+        <button class="primary wide" type="submit">上传并创建批次</button>
+      </form>
+    </section>
+
+    <section class="panel batchesPanel">
+      <div class="sectionTitle">
+        <h2>批次</h2>
+        <span id="batchHint"></span>
+      </div>
+      <div id="batchList" class="batchList"></div>
+    </section>
+
+    <section class="workspace">
+      <div class="summaryStrip">
+        <div><span>图片</span><strong id="sumImages">0</strong></div>
+        <div><span>已完成</span><strong id="sumDone">0</strong></div>
+        <div><span>芯片总数</span><strong id="sumTotal">0</strong></div>
+        <div><span>不良芯片</span><strong id="sumBad">0</strong></div>
+        <div><span>不良率</span><strong id="sumRate">0.00%</strong></div>
+      </div>
+
+      <div class="contentGrid">
+        <section class="panel imagePanel">
+          <div class="sectionTitle">
+            <h2 id="activeTitle">未选择批次</h2>
+            <div class="modeSwitch">
+              <button id="oneMode" class="active" type="button">当前图片</button>
+              <button id="batchMode" type="button">整批复用</button>
+            </div>
+          </div>
+
+          <div class="captureRow">
+            <label class="captureButton" for="cameraInput">拍照加入当前批次</label>
+            <input id="cameraInput" type="file" accept="image/*" capture="environment">
+            <label class="captureButton secondary" for="appendInput">继续选图加入批次</label>
+            <input id="appendInput" type="file" accept="image/*" multiple>
+          </div>
+
+          <div class="calibrationHelp">
+            <span>点选顺序：</span>
+            <b>上中</b><b>右中</b><b>下中</b><b>左中</b>
+          </div>
+          <div id="imageStage" class="imageStage">
+            <div class="emptyState">上传或选择一个批次后，在这里点选四个参考芯片中心</div>
+            <img id="mainImage" alt="">
+            <canvas id="pointCanvas"></canvas>
+          </div>
+          <div class="actions">
+            <button id="resetPoints" type="button">重选点</button>
+            <button id="submitPoints" class="primary" type="button">开始统计</button>
+          </div>
+        </section>
+
+        <section class="panel imageListPanel">
+          <div class="sectionTitle">
+            <h2>图片</h2>
+            <span id="pointStatus">0/4</span>
+          </div>
+          <div id="imageList" class="imageList"></div>
+        </section>
+      </div>
+
+      <section class="panel resultPanel">
+        <div class="sectionTitle">
+          <h2>结果复查</h2>
+          <span id="resultMeta"></span>
+        </div>
+        <div id="resultGrid" class="resultGrid">
+          <div class="emptyState">完成统计后显示结果图和网格检查图</div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
