@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+# Input photos and generated outputs
+*.jpg
+*.jpeg
+*.png
+
+# Spreadsheet/manual comparison files
+*.xlsx
+~$*
+
+# Local calibration files generated during runs
+calibration*.json
+points*.json
+
+# Local editor/system files
+.DS_Store
+Thumbs.db
