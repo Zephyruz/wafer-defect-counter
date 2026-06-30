@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -54,6 +55,11 @@ class Config:
     cell_height_fraction: float = 0.78
     inner_cell_scale: float = 0.68
     marker_cell_scale: float = 0.82
+    refine_grid: bool = False
+    grid_refine_offset_steps: int = 3
+    grid_refine_pitch_steps: int = 2
+    grid_refine_offset_fraction: float = 0.18
+    grid_refine_pitch_fraction: float = 0.018
 
     # Marker detection
     dark_value_max: int = 70
@@ -65,9 +71,16 @@ class Config:
     marker_min_pixels: int = 18
     marker_line_min_pixels: int = 10
     marker_line_min_length_fraction: float = 0.16
+    marker_line_max_length_fraction: float = 0.56
     marker_component_contrast_min: float = 32.0
     marker_grid_line_reject_fraction: float = 0.78
     marker_grid_line_thin_max: int = 5
+    bright_stain_value_min: int = 235
+    bright_stain_sat_max: int = 55
+    bright_stain_nearby_fraction: float = 0.35
+    smooth_shadow_texture_std_max: float = 4.0
+    smooth_shadow_marker_fraction_max: float = 0.010
+    smooth_shadow_total_fraction_max: float = 0.010
     marker_morph_kernel: int = 3
 
     # Missing-chip / blue-tape exposure detection
@@ -114,9 +127,21 @@ class ChipResult:
     marker_total_pixels: int
     marker_line_pixels: int
     marker_line_length: float
+    marker_line_too_long: bool
     marker_contrast: float
     blue_fraction: float
     texture_std: float
+
+
+@dataclass
+class ImageFeatures:
+    hsv: np.ndarray
+    gray: np.ndarray
+    h: np.ndarray
+    s: np.ndarray
+    v: np.ndarray
+    blue: np.ndarray
+    bright_stain: np.ndarray
 
 
 @dataclass
@@ -337,6 +362,65 @@ def generate_chip_cells(geometry: WaferGeometry, cfg: Config) -> list[ChipCell]:
     return cells
 
 
+def grid_alignment_score(response: np.ndarray, geometry: WaferGeometry) -> float:
+    rows = len(ROW_COUNTS)
+    max_cols = max(ROW_COUNTS)
+    pitch_x = geometry.width / max_cols
+    pitch_y = geometry.height / rows
+
+    values: list[float] = []
+    x0 = int(max(0, geometry.center[0] - geometry.width * 0.42))
+    x1 = int(min(response.shape[1] - 1, geometry.center[0] + geometry.width * 0.42))
+    y0 = int(max(0, geometry.center[1] - geometry.height * 0.42))
+    y1 = int(min(response.shape[0] - 1, geometry.center[1] + geometry.height * 0.42))
+    half_band = 2
+
+    for r in range(1, rows):
+        y = int(round(geometry.center[1] + (r - rows / 2.0) * pitch_y))
+        if half_band <= y < response.shape[0] - half_band and x1 > x0:
+            values.append(float(np.mean(response[y - half_band : y + half_band + 1, x0:x1])))
+
+    for c in range(1, max_cols):
+        x = int(round(geometry.center[0] + (c - max_cols / 2.0) * pitch_x))
+        if half_band <= x < response.shape[1] - half_band and y1 > y0:
+            values.append(float(np.mean(response[y0:y1, x - half_band : x + half_band + 1])))
+
+    return float(np.mean(values)) if values else 0.0
+
+
+def refine_grid_geometry(warped: np.ndarray, geometry: WaferGeometry, cfg: Config) -> tuple[WaferGeometry, float]:
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    response = cv2.GaussianBlur(255 - gray, (3, 3), 0)
+    if not cfg.refine_grid:
+        return geometry, grid_alignment_score(response, geometry)
+
+    pitch_x = geometry.width / max(ROW_COUNTS)
+    pitch_y = geometry.height / len(ROW_COUNTS)
+    offset_x_values = np.linspace(-pitch_x * cfg.grid_refine_offset_fraction, pitch_x * cfg.grid_refine_offset_fraction, cfg.grid_refine_offset_steps)
+    offset_y_values = np.linspace(-pitch_y * cfg.grid_refine_offset_fraction, pitch_y * cfg.grid_refine_offset_fraction, cfg.grid_refine_offset_steps)
+    pitch_x_scale_values = np.linspace(1.0 - cfg.grid_refine_pitch_fraction, 1.0 + cfg.grid_refine_pitch_fraction, cfg.grid_refine_pitch_steps * 2 + 1)
+    pitch_y_scale_values = np.linspace(1.0 - cfg.grid_refine_pitch_fraction, 1.0 + cfg.grid_refine_pitch_fraction, cfg.grid_refine_pitch_steps * 2 + 1)
+
+    best_geometry = geometry
+    best_score = grid_alignment_score(response, geometry)
+    for sx in pitch_x_scale_values:
+        for sy in pitch_y_scale_values:
+            for dx in offset_x_values:
+                for dy in offset_y_values:
+                    candidate = WaferGeometry(
+                        center=geometry.center + np.array([dx, dy], dtype=np.float32),
+                        width=float(geometry.width * sx),
+                        height=float(geometry.height * sy),
+                        angle_deg=geometry.angle_deg,
+                    )
+                    score = grid_alignment_score(response, candidate)
+                    if score > best_score:
+                        best_score = score
+                        best_geometry = candidate
+
+    return best_geometry, best_score
+
+
 def cell_polygon(cell: ChipCell, scale: float = 1.0) -> np.ndarray:
     rect = (tuple(cell.center), (cell.width * scale, cell.height * scale), cell.angle_deg)
     return cv2.boxPoints(rect).astype(np.int32)
@@ -364,10 +448,46 @@ def cell_mask(shape: tuple[int, int], cell: ChipCell, scale: float) -> np.ndarra
     return mask
 
 
+def local_cell_masks(shape: tuple[int, int], cell: ChipCell, cfg: Config) -> tuple[tuple[int, int, int, int], np.ndarray, np.ndarray]:
+    sample_poly = cell_polygon(cell, cfg.inner_cell_scale)
+    marker_poly = cell_polygon(cell, cfg.marker_cell_scale)
+    combined = np.vstack([sample_poly, marker_poly])
+    pad = max(3, int(min(cell.width, cell.height) * 0.08))
+    x0 = max(0, int(np.min(combined[:, 0])) - pad)
+    y0 = max(0, int(np.min(combined[:, 1])) - pad)
+    x1 = min(shape[1], int(np.max(combined[:, 0])) + pad + 1)
+    y1 = min(shape[0], int(np.max(combined[:, 1])) + pad + 1)
+    if x1 <= x0 or y1 <= y0:
+        return (0, 0, 1, 1), np.zeros((1, 1), dtype=np.uint8), np.zeros((1, 1), dtype=np.uint8)
+
+    offset = np.array([x0, y0], dtype=np.int32)
+    local_shape = (y1 - y0, x1 - x0)
+    sample = np.zeros(local_shape, dtype=np.uint8)
+    marker_sample = np.zeros(local_shape, dtype=np.uint8)
+    cv2.fillConvexPoly(sample, sample_poly - offset, 255)
+    cv2.fillConvexPoly(marker_sample, marker_poly - offset, 255)
+    return (x0, y0, x1, y1), sample, marker_sample
+
+
+def build_image_features(image: np.ndarray, cfg: Config) -> ImageFeatures:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blue = (
+        (h >= cfg.blue_hue_low)
+        & (h <= cfg.blue_hue_high)
+        & (s >= cfg.blue_sat_min)
+        & (v >= cfg.blue_value_min)
+    ).astype(np.uint8) * 255
+    bright_stain = ((v >= cfg.bright_stain_value_min) & (s <= cfg.bright_stain_sat_max)).astype(np.uint8) * 255
+    return ImageFeatures(hsv=hsv, gray=gray, h=h, s=s, v=v, blue=blue, bright_stain=bright_stain)
+
+
 def marker_component_metrics(
     binary: np.ndarray,
     sample_mask: np.ndarray,
     gray: np.ndarray,
+    bright_stain: np.ndarray,
     cfg: Config,
     cell: ChipCell,
 ) -> dict[str, float | int]:
@@ -382,6 +502,7 @@ def marker_component_metrics(
             "total_pixels": 0,
             "line_pixels": 0,
             "line_length": 0.0,
+            "line_too_long": 0,
             "contrast": 0.0,
         }
 
@@ -390,6 +511,7 @@ def marker_component_metrics(
     total_pixels = 0
     best_line_pixels = 0
     best_line_length = 0.0
+    best_line_too_long = 0
     best_contrast = 0.0
     background_values = gray[(sample_mask > 0) & (masked == 0)]
     background_median = float(np.median(background_values)) if background_values.size else float(np.median(gray[sample_mask > 0]))
@@ -403,6 +525,7 @@ def marker_component_metrics(
 
         line_length = float(max(w, h))
         line_thickness = float(min(w, h))
+        too_long_for_marker = line_length > max(cell.width, cell.height) * cfg.marker_line_max_length_fraction
         likely_grid_line = (
             line_length >= max(cell.width, cell.height) * cfg.marker_grid_line_reject_fraction
             and line_thickness <= cfg.marker_grid_line_thin_max
@@ -411,6 +534,17 @@ def marker_component_metrics(
             continue
 
         component = labels == label
+        pad = max(2, int(min(cell.width, cell.height) * 0.10))
+        x0 = max(0, int(stats[label, cv2.CC_STAT_LEFT]) - pad)
+        y0 = max(0, int(stats[label, cv2.CC_STAT_TOP]) - pad)
+        x1 = min(binary.shape[1], int(stats[label, cv2.CC_STAT_LEFT] + w) + pad)
+        y1 = min(binary.shape[0], int(stats[label, cv2.CC_STAT_TOP] + h) + pad)
+        nearby = bright_stain[y0:y1, x0:x1]
+        nearby_area = max(1, nearby.size)
+        bright_nearby_fraction = cv2.countNonZero(nearby) / nearby_area
+        if bright_nearby_fraction >= cfg.bright_stain_nearby_fraction:
+            continue
+
         component_values = gray[component]
         component_mean = float(np.mean(component_values)) if component_values.size else 255.0
         contrast = background_median - component_mean
@@ -424,6 +558,7 @@ def marker_component_metrics(
         if line_length > best_line_length:
             best_line_length = line_length
             best_line_pixels = area
+            best_line_too_long = int(too_long_for_marker)
             best_contrast = contrast
 
     if cfg.marker_morph_kernel > 1:
@@ -441,23 +576,19 @@ def marker_component_metrics(
         "total_pixels": total_pixels,
         "line_pixels": best_line_pixels,
         "line_length": best_line_length,
+        "line_too_long": best_line_too_long,
         "contrast": best_contrast,
     }
 
 
-def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    sample = cell_mask(gray.shape, cell, cfg.inner_cell_scale)
-    marker_sample = cell_mask(gray.shape, cell, cfg.marker_cell_scale)
-
-    blue = (
-        (h >= cfg.blue_hue_low)
-        & (h <= cfg.blue_hue_high)
-        & (s >= cfg.blue_sat_min)
-        & (v >= cfg.blue_value_min)
-    ).astype(np.uint8) * 255
+def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config, features: ImageFeatures | None = None) -> ChipResult:
+    features = features or build_image_features(image, cfg)
+    (x0, y0, x1, y1), sample, marker_sample = local_cell_masks(features.gray.shape, cell, cfg)
+    s = features.s[y0:y1, x0:x1]
+    v = features.v[y0:y1, x0:x1]
+    gray = features.gray[y0:y1, x0:x1]
+    blue = features.blue[y0:y1, x0:x1]
+    bright_stain = features.bright_stain[y0:y1, x0:x1]
 
     sample_area = max(1, int(cv2.countNonZero(sample)))
     blue_fraction = cv2.countNonZero(cv2.bitwise_and(blue, sample)) / sample_area
@@ -470,7 +601,7 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
     absolute_dark = v <= cfg.dark_value_max
     locally_dark = (v <= cfg.local_dark_value_max) & ((local_median_v - v) >= cfg.local_dark_delta_min)
     dark = ((absolute_dark | locally_dark) & (s <= cfg.dark_saturation_max)).astype(np.uint8) * 255
-    metrics = marker_component_metrics(dark, marker_sample, gray, cfg, cell)
+    metrics = marker_component_metrics(dark, marker_sample, gray, bright_stain, cfg, cell)
 
     marker_fraction = float(metrics["largest_fraction"])
     marker_pixels = int(metrics["largest_pixels"])
@@ -478,17 +609,30 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
     marker_total_pixels = int(metrics["total_pixels"])
     marker_line_pixels = int(metrics["line_pixels"])
     marker_line_length = float(metrics["line_length"])
+    marker_line_too_long = bool(metrics["line_too_long"])
     marker_contrast = float(metrics["contrast"])
 
     min_line_length = min(cell.width, cell.height) * cfg.marker_line_min_length_fraction
     marker_defect = (
         (marker_fraction >= cfg.marker_min_area_fraction and marker_pixels >= cfg.marker_min_pixels)
         or marker_total_fraction >= cfg.marker_total_area_fraction
-        or (marker_line_pixels >= cfg.marker_line_min_pixels and marker_line_length >= min_line_length)
+        or (
+            marker_line_pixels >= cfg.marker_line_min_pixels
+            and marker_line_length >= min_line_length
+            and not marker_line_too_long
+        )
     )
+    smooth_shadow_like = (
+        texture_std < cfg.smooth_shadow_texture_std_max
+        and marker_fraction < cfg.smooth_shadow_marker_fraction_max
+        and marker_total_fraction < cfg.smooth_shadow_total_fraction_max
+    )
+    if smooth_shadow_like:
+        marker_defect = False
     missing_defect = (
         blue_fraction >= cfg.blue_missing_fraction
         and texture_std <= cfg.low_texture_std_max
+        and values.size > 0
         and float(np.mean(v[sample > 0])) >= cfg.missing_value_min
     )
 
@@ -503,6 +647,7 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
         marker_total_pixels=marker_total_pixels,
         marker_line_pixels=marker_line_pixels,
         marker_line_length=marker_line_length,
+        marker_line_too_long=marker_line_too_long,
         marker_contrast=marker_contrast,
         blue_fraction=blue_fraction,
         texture_std=texture_std,
@@ -515,12 +660,15 @@ def analyze_image_manual(
     cfg: Config,
 ) -> tuple[list[ChipResult], WaferGeometry, dict[str, np.ndarray], np.ndarray, np.ndarray]:
     warped, matrix, inverse, geometry = perspective_from_points(image, points)
+    geometry, grid_score = refine_grid_geometry(warped, geometry, cfg)
     cells = generate_chip_cells(geometry, cfg)
-    results = [evaluate_chip(warped, cell, cfg) for cell in cells]
+    features = build_image_features(warped, cfg)
+    results = [evaluate_chip(warped, cell, cfg, features) for cell in cells]
     debug_masks = {
         "warped": warped,
         "manual_points": points,
         "perspective_matrix": matrix,
+        "grid_alignment_score": grid_score,
     }
     return results, geometry, debug_masks, warped, inverse
 
@@ -593,6 +741,11 @@ def draw_debug_grid(
 
     draw_text(out, f"网格角度：{geometry.angle_deg:.2f} 度", (18, 14), cfg, size=24, color=(255, 220, 100))
     draw_text(out, f"预期芯片数：{TOTAL_EXPECTED_CHIPS}", (18, 46), cfg, size=24, color=(255, 220, 100))
+    grid_score = debug_masks.get("grid_alignment_score")
+    if grid_score is not None:
+        draw_text(out, f"网格贴合分数：{float(grid_score):.1f}", (18, 78), cfg, size=24, color=(255, 220, 100))
+    refine_text = "开" if cfg.refine_grid else "关"
+    draw_text(out, f"网格微调：{refine_text}", (18, 110), cfg, size=24, color=(255, 220, 100))
     return out
 
 
@@ -640,6 +793,7 @@ def save_chip_report(path: Path, results: list[ChipResult]) -> None:
         "marker_total_pixels",
         "marker_line_pixels",
         "marker_line_length",
+        "marker_line_too_long",
         "marker_contrast",
         "blue_fraction",
         "texture_std",
@@ -662,11 +816,120 @@ def save_chip_report(path: Path, results: list[ChipResult]) -> None:
                     "marker_total_pixels": result.marker_total_pixels,
                     "marker_line_pixels": result.marker_line_pixels,
                     "marker_line_length": f"{result.marker_line_length:.2f}",
+                    "marker_line_too_long": int(result.marker_line_too_long),
                     "marker_contrast": f"{result.marker_contrast:.2f}",
                     "blue_fraction": f"{result.blue_fraction:.6f}",
                     "texture_std": f"{result.texture_std:.2f}",
                 }
             )
+
+
+def natural_sort_key(path: Path) -> list[int | str]:
+    parts = re.split(r"(\d+)", path.stem)
+    return [int(part) if part.isdigit() else part.lower() for part in parts]
+
+
+def find_points_file(points_dir: Path, image_path: Path) -> Path:
+    candidates = [
+        points_dir / f"{image_path.stem}.json",
+        points_dir / f"points{image_path.stem}.json",
+        points_dir / f"points_{image_path.stem}.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def process_one_image(
+    image_path: Path,
+    points: np.ndarray,
+    cfg: Config,
+    out_path: Path,
+    debug_path: Path,
+    report_path: Path | None,
+) -> list[ChipResult]:
+    image = load_image(image_path)
+    results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, points, cfg)
+    if len(results) != TOTAL_EXPECTED_CHIPS:
+        raise RuntimeError(f"内部布局错误：预期 {TOTAL_EXPECTED_CHIPS} 个芯片，实际 {len(results)} 个。")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    debug_path.parent.mkdir(parents=True, exist_ok=True)
+    annotated = annotate_results(image, results, cfg, cell_to_image=cell_to_image)
+    debug_grid = draw_debug_grid(image, results, geometry, debug_masks, cfg, cell_to_image=cell_to_image)
+    cv2.imwrite(str(out_path), annotated)
+    cv2.imwrite(str(debug_path), debug_grid)
+    if report_path:
+        save_chip_report(report_path, results)
+    return results
+
+
+def write_batch_summary(path: Path, rows: list[dict[str, int | float | str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["image", "total", "defective", "defect_rate", "marker_defects", "missing_defects", "result", "debug", "chip_report"]
+    with path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def process_batch(args: argparse.Namespace, cfg: Config) -> None:
+    batch_dir = args.batch_dir
+    output_dir = args.batch_output_dir
+    points_dir = args.points_dir or (output_dir / "points")
+    points_dir.mkdir(parents=True, exist_ok=True)
+
+    image_paths: list[Path] = []
+    for pattern in args.batch_pattern:
+        image_paths.extend(batch_dir.glob(pattern))
+    image_paths = sorted(set(path for path in image_paths if path.is_file()), key=natural_sort_key)
+    if not image_paths:
+        raise FileNotFoundError(f"没有在 {batch_dir} 找到图片。")
+
+    print(f"批量处理图片数：{len(image_paths)}")
+    summary_rows: list[dict[str, int | float | str]] = []
+    for image_path in image_paths:
+        points_path = find_points_file(points_dir, image_path)
+        print(f"\n处理：{image_path.name}")
+        if points_path.exists():
+            points = load_points(points_path)
+            print(f"已读取点位：{points_path}")
+        else:
+            image = load_image(image_path)
+            points = collect_manual_points(image, cfg)
+            save_points(points_path, points)
+            print(f"已保存点位：{points_path}")
+
+        stem = image_path.stem
+        out_path = output_dir / f"result{stem}.png"
+        debug_path = output_dir / f"debug{stem}.png"
+        report_path = output_dir / f"chips{stem}.csv"
+        results = process_one_image(image_path, points, cfg, out_path, debug_path, report_path)
+
+        total = len(results)
+        defective = sum(result.defective for result in results)
+        marker = sum(result.marker_defect for result in results)
+        missing = sum(result.missing_defect for result in results)
+        rate = defective / total if total else 0.0
+        summary_rows.append(
+            {
+                "image": image_path.name,
+                "total": total,
+                "defective": defective,
+                "defect_rate": f"{rate:.4f}",
+                "marker_defects": marker,
+                "missing_defects": missing,
+                "result": str(out_path),
+                "debug": str(debug_path),
+                "chip_report": str(report_path),
+            }
+        )
+        print(f"完成：缺陷 {defective}/{total}，缺陷率 {rate * 100:.2f}%")
+
+    summary_path = output_dir / "batch_summary.csv"
+    write_batch_summary(summary_path, summary_rows)
+    print(f"\n批量处理完成，汇总表：{summary_path}")
 
 
 def process_image_file(
@@ -695,7 +958,7 @@ def process_image_file(
     debug_grid = draw_debug_grid(image, results, geometry, debug_masks, cfg, cell_to_image=cell_to_image)
     cv2.imwrite(str(result_path), annotated)
     cv2.imwrite(str(debug_path), debug_grid)
-    write_chip_report(report_path, results)
+    save_chip_report(report_path, results)
 
     total = len(results)
     defective = sum(r.defective for r in results)
@@ -715,6 +978,7 @@ def process_image_file(
             "marker_total_pixels": r.marker_total_pixels,
             "marker_line_pixels": r.marker_line_pixels,
             "marker_line_length": r.marker_line_length,
+            "marker_line_too_long": r.marker_line_too_long,
             "marker_contrast": r.marker_contrast,
             "blue_fraction": r.blue_fraction,
             "texture_std": r.texture_std,
@@ -737,11 +1001,17 @@ def process_image_file(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="晶圆缺陷自动计数程序。默认点击上中、右中、下中、左中四颗参考芯片中心进行校准。")
-    parser.add_argument("image", type=Path, help="输入晶圆图片。")
+    parser.add_argument("image", type=Path, nargs="?", help="输入晶圆图片。")
     parser.add_argument("--out", type=Path, default=Path("result.png"), help="带缺陷标注的结果图。")
     parser.add_argument("--debug", type=Path, default=Path("debug_grid.png"), help="芯片网格调试图。")
     parser.add_argument("--debug-masks", type=Path, default=None, help="可选：保存额外调试图。")
     parser.add_argument("--chip-report", type=Path, default=None, help="可选：导出每颗芯片的检测指标 CSV。")
+    parser.add_argument("--batch-dir", type=Path, default=None, help="批量处理图片文件夹。")
+    parser.add_argument("--batch-output-dir", type=Path, default=Path("batch_output"), help="批量处理输出文件夹。")
+    parser.add_argument("--batch-pattern", nargs="*", default=["*.jpg", "*.jpeg"], help="批量图片匹配规则；默认不处理 PNG，避免把结果图当输入。")
+    parser.add_argument("--points-dir", type=Path, default=None, help="批量模式点位文件夹；没有点位时会弹窗点选并保存。")
+    parser.add_argument("--refine-grid", action="store_true", help="实验功能：自动微调网格中心和间距。默认关闭。")
+    parser.add_argument("--no-refine-grid", action="store_true", help="兼容旧参数：保持关闭网格自动微调。")
     parser.add_argument("--points", type=Path, default=None, help="读取已保存的四个参考芯片中心点，跳过人工点击。")
     parser.add_argument("--save-points", type=Path, default=None, help="保存本次人工点击的四个参考芯片中心点。")
 
@@ -751,6 +1021,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-cell-scale", type=float, default=None, help="marker 检测范围，调高可覆盖更靠边的墨迹。")
     parser.add_argument("--marker-min-area-fraction", type=float, default=None, help="标记最小面积比例，调高减少误报。")
     parser.add_argument("--marker-total-area-fraction", type=float, default=None, help="多个小墨迹累计面积比例阈值。")
+    parser.add_argument("--marker-line-max-length-fraction", type=float, default=None, help="线状 marker 最大长度比例，调低可减少边框阴影误报。")
+    parser.add_argument("--bright-stain-nearby-fraction", type=float, default=None, help="白色污渍附近比例阈值，调低会更严格排除亮污渍边缘。")
+    parser.add_argument("--smooth-shadow-texture-std-max", type=float, default=None, help="平滑小暗影过滤：纹理标准差上限，调低会减少过滤。")
+    parser.add_argument("--smooth-shadow-marker-fraction-max", type=float, default=None, help="平滑小暗影过滤：最大单块面积比例。")
+    parser.add_argument("--smooth-shadow-total-fraction-max", type=float, default=None, help="平滑小暗影过滤：累计面积比例。")
     parser.add_argument("--blue-missing-fraction", type=float, default=None, help="蓝膜暴露比例阈值，调高减少缺片误报。")
     return parser.parse_args()
 
@@ -758,6 +1033,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = Config()
+    if args.refine_grid:
+        cfg.refine_grid = True
+    if args.no_refine_grid:
+        cfg.refine_grid = False
 
     for arg_name, cfg_name in [
         ("dark_value_max", "dark_value_max"),
@@ -766,11 +1045,23 @@ def main() -> None:
         ("marker_cell_scale", "marker_cell_scale"),
         ("marker_min_area_fraction", "marker_min_area_fraction"),
         ("marker_total_area_fraction", "marker_total_area_fraction"),
+        ("marker_line_max_length_fraction", "marker_line_max_length_fraction"),
+        ("bright_stain_nearby_fraction", "bright_stain_nearby_fraction"),
+        ("smooth_shadow_texture_std_max", "smooth_shadow_texture_std_max"),
+        ("smooth_shadow_marker_fraction_max", "smooth_shadow_marker_fraction_max"),
+        ("smooth_shadow_total_fraction_max", "smooth_shadow_total_fraction_max"),
         ("blue_missing_fraction", "blue_missing_fraction"),
     ]:
         value = getattr(args, arg_name)
         if value is not None:
             setattr(cfg, cfg_name, value)
+
+    if args.batch_dir:
+        process_batch(args, cfg)
+        return
+
+    if args.image is None:
+        raise SystemExit("请提供一张图片，或使用 --batch-dir 指定批量处理文件夹。")
 
     image = load_image(args.image)
     print("当前模式：人工参考芯片中心校准。")

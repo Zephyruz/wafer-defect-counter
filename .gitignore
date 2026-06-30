@@ -9,6 +9,7 @@ __pycache__/
 
 # Local test/output folders
 测试结果/
+test results/
 web_data/
 
 # Spreadsheet/manual comparison files
@@ -18,6 +19,7 @@ web_data/
 # Local calibration files generated during runs
 calibration*.json
 points*.json
+points_*/
 
 # Local editor/system files
 .DS_Store
