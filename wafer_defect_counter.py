@@ -53,6 +53,7 @@ class Config:
     cell_width_fraction: float = 0.82
     cell_height_fraction: float = 0.78
     inner_cell_scale: float = 0.68
+    marker_cell_scale: float = 0.82
 
     # Marker detection
     dark_value_max: int = 70
@@ -65,6 +66,8 @@ class Config:
     marker_line_min_pixels: int = 10
     marker_line_min_length_fraction: float = 0.16
     marker_component_contrast_min: float = 32.0
+    marker_grid_line_reject_fraction: float = 0.78
+    marker_grid_line_thin_max: int = 5
     marker_morph_kernel: int = 3
 
     # Missing-chip / blue-tape exposure detection
@@ -366,6 +369,7 @@ def marker_component_metrics(
     sample_mask: np.ndarray,
     gray: np.ndarray,
     cfg: Config,
+    cell: ChipCell,
 ) -> dict[str, float | int]:
     masked = cv2.bitwise_and(binary, sample_mask)
     sample_area = max(1, int(cv2.countNonZero(sample_mask)))
@@ -391,12 +395,19 @@ def marker_component_metrics(
     background_median = float(np.median(background_values)) if background_values.size else float(np.median(gray[sample_mask > 0]))
 
     for label in range(1, components):
-        x = int(stats[label, cv2.CC_STAT_LEFT])
-        y = int(stats[label, cv2.CC_STAT_TOP])
         w = int(stats[label, cv2.CC_STAT_WIDTH])
         h = int(stats[label, cv2.CC_STAT_HEIGHT])
         area = int(stats[label, cv2.CC_STAT_AREA])
         if area < cfg.marker_line_min_pixels:
+            continue
+
+        line_length = float(max(w, h))
+        line_thickness = float(min(w, h))
+        likely_grid_line = (
+            line_length >= max(cell.width, cell.height) * cfg.marker_grid_line_reject_fraction
+            and line_thickness <= cfg.marker_grid_line_thin_max
+        )
+        if likely_grid_line:
             continue
 
         component = labels == label
@@ -410,7 +421,6 @@ def marker_component_metrics(
         largest_pixels = max(largest_pixels, area)
         total_pixels += area
 
-        line_length = float(max(w, h))
         if line_length > best_line_length:
             best_line_length = line_length
             best_line_pixels = area
@@ -440,6 +450,7 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
     h, s, v = cv2.split(hsv)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     sample = cell_mask(gray.shape, cell, cfg.inner_cell_scale)
+    marker_sample = cell_mask(gray.shape, cell, cfg.marker_cell_scale)
 
     blue = (
         (h >= cfg.blue_hue_low)
@@ -453,12 +464,13 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config) -> ChipResult:
 
     values = gray[sample > 0]
     texture_std = float(np.std(values)) if values.size else 0.0
-    local_median_v = float(np.median(v[sample > 0])) if values.size else 0.0
+    marker_values = gray[marker_sample > 0]
+    local_median_v = float(np.median(v[marker_sample > 0])) if marker_values.size else 0.0
 
     absolute_dark = v <= cfg.dark_value_max
     locally_dark = (v <= cfg.local_dark_value_max) & ((local_median_v - v) >= cfg.local_dark_delta_min)
     dark = ((absolute_dark | locally_dark) & (s <= cfg.dark_saturation_max)).astype(np.uint8) * 255
-    metrics = marker_component_metrics(dark, sample, gray, cfg)
+    metrics = marker_component_metrics(dark, marker_sample, gray, cfg, cell)
 
     marker_fraction = float(metrics["largest_fraction"])
     marker_pixels = int(metrics["largest_pixels"])
@@ -736,6 +748,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dark-value-max", type=int, default=None, help="黑色标记亮度阈值，调高可识别更淡笔迹。")
     parser.add_argument("--local-dark-value-max", type=int, default=None, help="相对背景变暗检测的最高亮度，调高可识别更淡笔迹。")
     parser.add_argument("--local-dark-delta-min", type=int, default=None, help="相对背景至少变暗多少才算候选墨迹。")
+    parser.add_argument("--marker-cell-scale", type=float, default=None, help="marker 检测范围，调高可覆盖更靠边的墨迹。")
     parser.add_argument("--marker-min-area-fraction", type=float, default=None, help="标记最小面积比例，调高减少误报。")
     parser.add_argument("--marker-total-area-fraction", type=float, default=None, help="多个小墨迹累计面积比例阈值。")
     parser.add_argument("--blue-missing-fraction", type=float, default=None, help="蓝膜暴露比例阈值，调高减少缺片误报。")
@@ -750,6 +763,7 @@ def main() -> None:
         ("dark_value_max", "dark_value_max"),
         ("local_dark_value_max", "local_dark_value_max"),
         ("local_dark_delta_min", "local_dark_delta_min"),
+        ("marker_cell_scale", "marker_cell_scale"),
         ("marker_min_area_fraction", "marker_min_area_fraction"),
         ("marker_total_area_fraction", "marker_total_area_fraction"),
         ("blue_missing_fraction", "blue_missing_fraction"),
