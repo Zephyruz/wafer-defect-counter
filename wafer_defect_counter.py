@@ -71,16 +71,9 @@ class Config:
     marker_min_pixels: int = 18
     marker_line_min_pixels: int = 10
     marker_line_min_length_fraction: float = 0.16
-    marker_line_max_length_fraction: float = 0.56
     marker_component_contrast_min: float = 32.0
     marker_grid_line_reject_fraction: float = 0.78
     marker_grid_line_thin_max: int = 5
-    bright_stain_value_min: int = 235
-    bright_stain_sat_max: int = 55
-    bright_stain_nearby_fraction: float = 0.35
-    smooth_shadow_texture_std_max: float = 4.0
-    smooth_shadow_marker_fraction_max: float = 0.010
-    smooth_shadow_total_fraction_max: float = 0.010
     marker_morph_kernel: int = 3
 
     # Missing-chip / blue-tape exposure detection
@@ -127,7 +120,6 @@ class ChipResult:
     marker_total_pixels: int
     marker_line_pixels: int
     marker_line_length: float
-    marker_line_too_long: bool
     marker_contrast: float
     blue_fraction: float
     texture_std: float
@@ -141,7 +133,6 @@ class ImageFeatures:
     s: np.ndarray
     v: np.ndarray
     blue: np.ndarray
-    bright_stain: np.ndarray
 
 
 @dataclass
@@ -479,15 +470,13 @@ def build_image_features(image: np.ndarray, cfg: Config) -> ImageFeatures:
         & (s >= cfg.blue_sat_min)
         & (v >= cfg.blue_value_min)
     ).astype(np.uint8) * 255
-    bright_stain = ((v >= cfg.bright_stain_value_min) & (s <= cfg.bright_stain_sat_max)).astype(np.uint8) * 255
-    return ImageFeatures(hsv=hsv, gray=gray, h=h, s=s, v=v, blue=blue, bright_stain=bright_stain)
+    return ImageFeatures(hsv=hsv, gray=gray, h=h, s=s, v=v, blue=blue)
 
 
 def marker_component_metrics(
     binary: np.ndarray,
     sample_mask: np.ndarray,
     gray: np.ndarray,
-    bright_stain: np.ndarray,
     cfg: Config,
     cell: ChipCell,
 ) -> dict[str, float | int]:
@@ -502,7 +491,6 @@ def marker_component_metrics(
             "total_pixels": 0,
             "line_pixels": 0,
             "line_length": 0.0,
-            "line_too_long": 0,
             "contrast": 0.0,
         }
 
@@ -511,7 +499,6 @@ def marker_component_metrics(
     total_pixels = 0
     best_line_pixels = 0
     best_line_length = 0.0
-    best_line_too_long = 0
     best_contrast = 0.0
     background_values = gray[(sample_mask > 0) & (masked == 0)]
     background_median = float(np.median(background_values)) if background_values.size else float(np.median(gray[sample_mask > 0]))
@@ -525,7 +512,6 @@ def marker_component_metrics(
 
         line_length = float(max(w, h))
         line_thickness = float(min(w, h))
-        too_long_for_marker = line_length > max(cell.width, cell.height) * cfg.marker_line_max_length_fraction
         likely_grid_line = (
             line_length >= max(cell.width, cell.height) * cfg.marker_grid_line_reject_fraction
             and line_thickness <= cfg.marker_grid_line_thin_max
@@ -534,17 +520,6 @@ def marker_component_metrics(
             continue
 
         component = labels == label
-        pad = max(2, int(min(cell.width, cell.height) * 0.10))
-        x0 = max(0, int(stats[label, cv2.CC_STAT_LEFT]) - pad)
-        y0 = max(0, int(stats[label, cv2.CC_STAT_TOP]) - pad)
-        x1 = min(binary.shape[1], int(stats[label, cv2.CC_STAT_LEFT] + w) + pad)
-        y1 = min(binary.shape[0], int(stats[label, cv2.CC_STAT_TOP] + h) + pad)
-        nearby = bright_stain[y0:y1, x0:x1]
-        nearby_area = max(1, nearby.size)
-        bright_nearby_fraction = cv2.countNonZero(nearby) / nearby_area
-        if bright_nearby_fraction >= cfg.bright_stain_nearby_fraction:
-            continue
-
         component_values = gray[component]
         component_mean = float(np.mean(component_values)) if component_values.size else 255.0
         contrast = background_median - component_mean
@@ -558,7 +533,6 @@ def marker_component_metrics(
         if line_length > best_line_length:
             best_line_length = line_length
             best_line_pixels = area
-            best_line_too_long = int(too_long_for_marker)
             best_contrast = contrast
 
     if cfg.marker_morph_kernel > 1:
@@ -576,7 +550,6 @@ def marker_component_metrics(
         "total_pixels": total_pixels,
         "line_pixels": best_line_pixels,
         "line_length": best_line_length,
-        "line_too_long": best_line_too_long,
         "contrast": best_contrast,
     }
 
@@ -588,7 +561,6 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config, features: Imag
     v = features.v[y0:y1, x0:x1]
     gray = features.gray[y0:y1, x0:x1]
     blue = features.blue[y0:y1, x0:x1]
-    bright_stain = features.bright_stain[y0:y1, x0:x1]
 
     sample_area = max(1, int(cv2.countNonZero(sample)))
     blue_fraction = cv2.countNonZero(cv2.bitwise_and(blue, sample)) / sample_area
@@ -601,7 +573,7 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config, features: Imag
     absolute_dark = v <= cfg.dark_value_max
     locally_dark = (v <= cfg.local_dark_value_max) & ((local_median_v - v) >= cfg.local_dark_delta_min)
     dark = ((absolute_dark | locally_dark) & (s <= cfg.dark_saturation_max)).astype(np.uint8) * 255
-    metrics = marker_component_metrics(dark, marker_sample, gray, bright_stain, cfg, cell)
+    metrics = marker_component_metrics(dark, marker_sample, gray, cfg, cell)
 
     marker_fraction = float(metrics["largest_fraction"])
     marker_pixels = int(metrics["largest_pixels"])
@@ -609,26 +581,14 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config, features: Imag
     marker_total_pixels = int(metrics["total_pixels"])
     marker_line_pixels = int(metrics["line_pixels"])
     marker_line_length = float(metrics["line_length"])
-    marker_line_too_long = bool(metrics["line_too_long"])
     marker_contrast = float(metrics["contrast"])
 
     min_line_length = min(cell.width, cell.height) * cfg.marker_line_min_length_fraction
     marker_defect = (
         (marker_fraction >= cfg.marker_min_area_fraction and marker_pixels >= cfg.marker_min_pixels)
         or marker_total_fraction >= cfg.marker_total_area_fraction
-        or (
-            marker_line_pixels >= cfg.marker_line_min_pixels
-            and marker_line_length >= min_line_length
-            and not marker_line_too_long
-        )
+        or (marker_line_pixels >= cfg.marker_line_min_pixels and marker_line_length >= min_line_length)
     )
-    smooth_shadow_like = (
-        texture_std < cfg.smooth_shadow_texture_std_max
-        and marker_fraction < cfg.smooth_shadow_marker_fraction_max
-        and marker_total_fraction < cfg.smooth_shadow_total_fraction_max
-    )
-    if smooth_shadow_like:
-        marker_defect = False
     missing_defect = (
         blue_fraction >= cfg.blue_missing_fraction
         and texture_std <= cfg.low_texture_std_max
@@ -647,7 +607,6 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config, features: Imag
         marker_total_pixels=marker_total_pixels,
         marker_line_pixels=marker_line_pixels,
         marker_line_length=marker_line_length,
-        marker_line_too_long=marker_line_too_long,
         marker_contrast=marker_contrast,
         blue_fraction=blue_fraction,
         texture_std=texture_std,
@@ -793,7 +752,6 @@ def save_chip_report(path: Path, results: list[ChipResult]) -> None:
         "marker_total_pixels",
         "marker_line_pixels",
         "marker_line_length",
-        "marker_line_too_long",
         "marker_contrast",
         "blue_fraction",
         "texture_std",
@@ -816,7 +774,6 @@ def save_chip_report(path: Path, results: list[ChipResult]) -> None:
                     "marker_total_pixels": result.marker_total_pixels,
                     "marker_line_pixels": result.marker_line_pixels,
                     "marker_line_length": f"{result.marker_line_length:.2f}",
-                    "marker_line_too_long": int(result.marker_line_too_long),
                     "marker_contrast": f"{result.marker_contrast:.2f}",
                     "blue_fraction": f"{result.blue_fraction:.6f}",
                     "texture_std": f"{result.texture_std:.2f}",
@@ -978,7 +935,6 @@ def process_image_file(
             "marker_total_pixels": r.marker_total_pixels,
             "marker_line_pixels": r.marker_line_pixels,
             "marker_line_length": r.marker_line_length,
-            "marker_line_too_long": r.marker_line_too_long,
             "marker_contrast": r.marker_contrast,
             "blue_fraction": r.blue_fraction,
             "texture_std": r.texture_std,
@@ -1021,11 +977,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-cell-scale", type=float, default=None, help="marker 检测范围，调高可覆盖更靠边的墨迹。")
     parser.add_argument("--marker-min-area-fraction", type=float, default=None, help="标记最小面积比例，调高减少误报。")
     parser.add_argument("--marker-total-area-fraction", type=float, default=None, help="多个小墨迹累计面积比例阈值。")
-    parser.add_argument("--marker-line-max-length-fraction", type=float, default=None, help="线状 marker 最大长度比例，调低可减少边框阴影误报。")
-    parser.add_argument("--bright-stain-nearby-fraction", type=float, default=None, help="白色污渍附近比例阈值，调低会更严格排除亮污渍边缘。")
-    parser.add_argument("--smooth-shadow-texture-std-max", type=float, default=None, help="平滑小暗影过滤：纹理标准差上限，调低会减少过滤。")
-    parser.add_argument("--smooth-shadow-marker-fraction-max", type=float, default=None, help="平滑小暗影过滤：最大单块面积比例。")
-    parser.add_argument("--smooth-shadow-total-fraction-max", type=float, default=None, help="平滑小暗影过滤：累计面积比例。")
     parser.add_argument("--blue-missing-fraction", type=float, default=None, help="蓝膜暴露比例阈值，调高减少缺片误报。")
     return parser.parse_args()
 
@@ -1045,11 +996,6 @@ def main() -> None:
         ("marker_cell_scale", "marker_cell_scale"),
         ("marker_min_area_fraction", "marker_min_area_fraction"),
         ("marker_total_area_fraction", "marker_total_area_fraction"),
-        ("marker_line_max_length_fraction", "marker_line_max_length_fraction"),
-        ("bright_stain_nearby_fraction", "bright_stain_nearby_fraction"),
-        ("smooth_shadow_texture_std_max", "smooth_shadow_texture_std_max"),
-        ("smooth_shadow_marker_fraction_max", "smooth_shadow_marker_fraction_max"),
-        ("smooth_shadow_total_fraction_max", "smooth_shadow_total_fraction_max"),
         ("blue_missing_fraction", "blue_missing_fraction"),
     ]:
         value = getattr(args, arg_name)
