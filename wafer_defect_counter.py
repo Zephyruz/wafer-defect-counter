@@ -64,17 +64,18 @@ class Config:
     # Marker detection
     dark_value_max: int = 70
     local_dark_value_max: int = 135
-    local_dark_delta_min: int = 35
+    local_dark_delta_min: int = 45
     dark_saturation_max: int = 210
     marker_min_area_fraction: float = 0.018
     marker_total_area_fraction: float = 0.024
     marker_min_pixels: int = 18
     marker_line_min_pixels: int = 10
     marker_line_min_length_fraction: float = 0.16
-    marker_component_contrast_min: float = 32.0
+    marker_component_contrast_min: float = 42.0
     marker_grid_line_reject_fraction: float = 0.78
     marker_grid_line_thin_max: int = 5
     marker_morph_kernel: int = 3
+    review_margin: float = 0.72
 
     # Missing-chip / blue-tape exposure detection
     blue_missing_fraction: float = 0.18
@@ -123,6 +124,8 @@ class ChipResult:
     marker_contrast: float
     blue_fraction: float
     texture_std: float
+    review_candidate: bool
+    review_reason: str
 
 
 @dataclass
@@ -595,6 +598,18 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config, features: Imag
         and values.size > 0
         and float(np.mean(v[sample > 0])) >= cfg.missing_value_min
     )
+    review_reasons: list[str] = []
+    if not marker_defect:
+        margin = cfg.review_margin
+        if marker_fraction >= cfg.marker_min_area_fraction * margin and marker_pixels >= cfg.marker_min_pixels * margin:
+            review_reasons.append("near_marker_area")
+        if marker_total_fraction >= cfg.marker_total_area_fraction * margin:
+            review_reasons.append("near_marker_total")
+        if marker_line_pixels >= cfg.marker_line_min_pixels * margin and marker_line_length >= min_line_length * margin:
+            review_reasons.append("near_marker_line")
+    if not missing_defect and blue_fraction >= cfg.blue_missing_fraction * cfg.review_margin:
+        review_reasons.append("near_missing_chip")
+    review_candidate = bool(review_reasons) and not (marker_defect or missing_defect)
 
     return ChipResult(
         cell=cell,
@@ -610,6 +625,8 @@ def evaluate_chip(image: np.ndarray, cell: ChipCell, cfg: Config, features: Imag
         marker_contrast=marker_contrast,
         blue_fraction=blue_fraction,
         texture_std=texture_std,
+        review_candidate=review_candidate,
+        review_reason=";".join(review_reasons),
     )
 
 
@@ -755,6 +772,8 @@ def save_chip_report(path: Path, results: list[ChipResult]) -> None:
         "marker_contrast",
         "blue_fraction",
         "texture_std",
+        "review_candidate",
+        "review_reason",
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
@@ -777,6 +796,8 @@ def save_chip_report(path: Path, results: list[ChipResult]) -> None:
                     "marker_contrast": f"{result.marker_contrast:.2f}",
                     "blue_fraction": f"{result.blue_fraction:.6f}",
                     "texture_std": f"{result.texture_std:.2f}",
+                    "review_candidate": int(result.review_candidate),
+                    "review_reason": result.review_reason,
                 }
             )
 
@@ -824,7 +845,18 @@ def process_one_image(
 
 def write_batch_summary(path: Path, rows: list[dict[str, int | float | str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["image", "total", "defective", "defect_rate", "marker_defects", "missing_defects", "result", "debug", "chip_report"]
+    fields = [
+        "image",
+        "total",
+        "defective",
+        "defect_rate",
+        "marker_defects",
+        "missing_defects",
+        "review_candidates",
+        "result",
+        "debug",
+        "chip_report",
+    ]
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
@@ -868,6 +900,7 @@ def process_batch(args: argparse.Namespace, cfg: Config) -> None:
         defective = sum(result.defective for result in results)
         marker = sum(result.marker_defect for result in results)
         missing = sum(result.missing_defect for result in results)
+        review = sum(result.review_candidate for result in results)
         rate = defective / total if total else 0.0
         summary_rows.append(
             {
@@ -877,12 +910,13 @@ def process_batch(args: argparse.Namespace, cfg: Config) -> None:
                 "defect_rate": f"{rate:.4f}",
                 "marker_defects": marker,
                 "missing_defects": missing,
+                "review_candidates": review,
                 "result": str(out_path),
                 "debug": str(debug_path),
                 "chip_report": str(report_path),
             }
         )
-        print(f"完成：缺陷 {defective}/{total}，缺陷率 {rate * 100:.2f}%")
+        print(f"完成：缺陷 {defective}/{total}，缺陷率 {rate * 100:.2f}%，建议复核 {review} 颗")
 
     summary_path = output_dir / "batch_summary.csv"
     write_batch_summary(summary_path, summary_rows)
@@ -938,6 +972,8 @@ def process_image_file(
             "marker_contrast": r.marker_contrast,
             "blue_fraction": r.blue_fraction,
             "texture_std": r.texture_std,
+            "review_candidate": r.review_candidate,
+            "review_reason": r.review_reason,
         }
         for r in results
     ]
@@ -955,6 +991,21 @@ def process_image_file(
     )
 
 
+def apply_detection_preset(cfg: Config, preset: str) -> None:
+    """Apply coarse threshold presets before per-parameter CLI overrides."""
+    if preset == "sensitive":
+        cfg.local_dark_delta_min = 35
+        cfg.marker_component_contrast_min = 32.0
+    elif preset == "balanced":
+        cfg.local_dark_delta_min = 45
+        cfg.marker_component_contrast_min = 42.0
+    elif preset == "strict":
+        cfg.local_dark_delta_min = 45
+        cfg.marker_component_contrast_min = 46.0
+    else:
+        raise ValueError(f"Unknown detection preset: {preset}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="晶圆缺陷自动计数程序。默认点击上中、右中、下中、左中四颗参考芯片中心进行校准。")
     parser.add_argument("image", type=Path, nargs="?", help="输入晶圆图片。")
@@ -970,6 +1021,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-refine-grid", action="store_true", help="兼容旧参数：保持关闭网格自动微调。")
     parser.add_argument("--points", type=Path, default=None, help="读取已保存的四个参考芯片中心点，跳过人工点击。")
     parser.add_argument("--save-points", type=Path, default=None, help="保存本次人工点击的四个参考芯片中心点。")
+    parser.add_argument(
+        "--detection-preset",
+        choices=["balanced", "sensitive", "strict"],
+        default="balanced",
+        help="检测预设：balanced 为默认；sensitive 等同已存档第四版阈值；strict 更保守。",
+    )
 
     parser.add_argument("--dark-value-max", type=int, default=None, help="黑色标记亮度阈值，调高可识别更淡笔迹。")
     parser.add_argument("--local-dark-value-max", type=int, default=None, help="相对背景变暗检测的最高亮度，调高可识别更淡笔迹。")
@@ -984,6 +1041,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = Config()
+    apply_detection_preset(cfg, args.detection_preset)
     if args.refine_grid:
         cfg.refine_grid = True
     if args.no_refine_grid:
