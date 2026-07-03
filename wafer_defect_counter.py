@@ -146,16 +146,28 @@ class ImageAnalysisSummary:
     marker_defects: int
     missing_defects: int
     result_image: str
+    review_image: str
     debug_image: str
     chip_report: str
     chips: list[dict[str, int | float | bool]]
 
 
 def load_image(path: Path) -> np.ndarray:
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    data = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"无法读取图片：{path}")
     return image
+
+
+def save_image(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = path.suffix or ".png"
+    params = [cv2.IMWRITE_JPEG_QUALITY, 88] if suffix.lower() in {".jpg", ".jpeg"} else []
+    ok, encoded = cv2.imencode(suffix, image, params)
+    if not ok:
+        raise RuntimeError(f"无法保存图片：{path}")
+    encoded.tofile(str(path))
 
 
 def load_chinese_font(cfg: Config, size: int):
@@ -666,6 +678,7 @@ def annotate_results(
     results: Iterable[ChipResult],
     cfg: Config,
     cell_to_image: np.ndarray | None = None,
+    draw_indices: bool = True,
 ) -> np.ndarray:
     out = image.copy()
     results = list(results)
@@ -673,8 +686,9 @@ def annotate_results(
         color = cfg.defect_color if result.defective else cfg.normal_color
         polygon = transform_polygon(cell_polygon(result.cell), cell_to_image)
         cv2.polylines(out, [polygon], True, color, cfg.line_thickness, cv2.LINE_AA)
-        center = transform_point(result.cell.center, cell_to_image)
-        draw_label(out, str(result.cell.index), (center[0] - 10, center[1] + 5), scale=0.38, color=color)
+        if draw_indices:
+            center = transform_point(result.cell.center, cell_to_image)
+            draw_label(out, str(result.cell.index), (center[0] - 10, center[1] + 5), scale=0.38, color=color)
 
     defective = sum(r.defective for r in results)
     total = len(results)
@@ -836,8 +850,8 @@ def process_one_image(
     debug_path.parent.mkdir(parents=True, exist_ok=True)
     annotated = annotate_results(image, results, cfg, cell_to_image=cell_to_image)
     debug_grid = draw_debug_grid(image, results, geometry, debug_masks, cfg, cell_to_image=cell_to_image)
-    cv2.imwrite(str(out_path), annotated)
-    cv2.imwrite(str(debug_path), debug_grid)
+    save_image(out_path, annotated)
+    save_image(debug_path, debug_grid)
     if report_path:
         save_chip_report(report_path, results)
     return results
@@ -942,53 +956,68 @@ def process_image_file(
     if len(results) != TOTAL_EXPECTED_CHIPS:
         raise RuntimeError(f"Expected {TOTAL_EXPECTED_CHIPS} chips, got {len(results)}")
 
-    result_path = output_dir / f"{image_path.stem}_result.png"
-    debug_path = output_dir / f"{image_path.stem}_grid.png"
+    review_path = output_dir / f"{image_path.stem}_review.jpg"
+    debug_path = output_dir / f"{image_path.stem}_grid.jpg"
     report_path = output_dir / f"{image_path.stem}_chips.csv"
-    annotated = annotate_results(image, results, cfg, cell_to_image=cell_to_image)
+    review = annotate_results(image, results, cfg, cell_to_image=cell_to_image, draw_indices=False)
     debug_grid = draw_debug_grid(image, results, geometry, debug_masks, cfg, cell_to_image=cell_to_image)
-    cv2.imwrite(str(result_path), annotated)
-    cv2.imwrite(str(debug_path), debug_grid)
+    save_image(review_path, review)
+    save_image(debug_path, debug_grid)
     save_chip_report(report_path, results)
 
     total = len(results)
     defective = sum(r.defective for r in results)
     marker = sum(r.marker_defect for r in results)
     missing = sum(r.missing_defect for r in results)
-    chips = [
-        {
-            "index": r.cell.index,
-            "row": r.cell.row,
-            "col": r.cell.col,
-            "defective": r.defective,
-            "marker_defect": r.marker_defect,
-            "missing_defect": r.missing_defect,
-            "marker_fraction": r.marker_fraction,
-            "marker_total_fraction": r.marker_total_fraction,
-            "marker_largest_pixels": r.marker_largest_pixels,
-            "marker_total_pixels": r.marker_total_pixels,
-            "marker_line_pixels": r.marker_line_pixels,
-            "marker_line_length": r.marker_line_length,
-            "marker_contrast": r.marker_contrast,
-            "blue_fraction": r.blue_fraction,
-            "texture_std": r.texture_std,
-            "review_candidate": r.review_candidate,
-            "review_reason": r.review_reason,
-        }
-        for r in results
-    ]
-
     return ImageAnalysisSummary(
         total_chips=total,
         defective_chips=defective,
         defect_rate=defective / total if total else 0.0,
         marker_defects=marker,
         missing_defects=missing,
-        result_image=str(result_path),
+        result_image=str(review_path),
+        review_image=str(review_path),
         debug_image=str(debug_path),
         chip_report=str(report_path),
-        chips=chips,
+        chips=[],
     )
+
+
+def generate_grid_preview_file(
+    image_path: Path,
+    points: list[list[float]] | np.ndarray,
+    output_dir: Path,
+    cfg: Config | None = None,
+) -> str:
+    """Generate only the calibrated grid preview, before running defect detection."""
+    cfg = cfg or Config()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image = load_image(image_path)
+    point_array = np.array(points, dtype=np.float32)
+    if point_array.shape != (4, 2):
+        raise ValueError("points must contain four [x, y] coordinates")
+
+    _warped, _matrix, cell_to_image, geometry = perspective_from_points(image, point_array)
+    cells = generate_chip_cells(geometry, cfg)
+
+    out = image.copy()
+    rect = (tuple(geometry.center), (geometry.width, geometry.height), geometry.angle_deg)
+    outer = transform_polygon(cv2.boxPoints(rect).astype(np.int32), cell_to_image)
+    cv2.polylines(out, [outer], True, cfg.grid_color, 3, cv2.LINE_AA)
+    for cell in cells:
+        polygon = transform_polygon(cell_polygon(cell), cell_to_image)
+        cv2.polylines(out, [polygon], True, cfg.grid_color, 1, cv2.LINE_AA)
+
+    for point_index, point in enumerate(point_array, start=1):
+        center = tuple(np.round(point).astype(int))
+        cv2.circle(out, center, 8, (0, 0, 255), 2, cv2.LINE_AA)
+        draw_label(out, str(point_index), (center[0] + 10, center[1] - 10), scale=0.7, color=(0, 0, 255))
+
+    draw_text(out, "网格预览：确认框线对齐后再开始统计", (18, 14), cfg, size=26, color=(255, 220, 100))
+    preview_path = output_dir / f"{image_path.stem}_grid_preview.jpg"
+    save_image(preview_path, out)
+    return str(preview_path)
 
 
 def apply_detection_preset(cfg: Config, preset: str) -> None:
@@ -1088,8 +1117,8 @@ def main() -> None:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.debug.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(args.out), annotated)
-    cv2.imwrite(str(args.debug), debug_grid)
+    save_image(args.out, annotated)
+    save_image(args.debug, debug_grid)
     if args.debug_masks:
         save_matplotlib_debug(args.debug_masks, image, debug_masks)
     if args.chip_report:

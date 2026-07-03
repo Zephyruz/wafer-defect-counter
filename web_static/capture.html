@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>手机拍照上传</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="capturePage">
+  <header class="topbar">
+    <div>
+      <h1>手机拍照上传</h1>
+      <p>手机只负责拍照，电脑负责点位和统计</p>
+    </div>
+    <button id="refreshBtn" class="iconButton" title="刷新">↻</button>
+  </header>
+
+  <main class="captureShell">
+    <section class="panel capturePanel">
+      <h2 id="activeName">未开始</h2>
+      <p id="uploadStatus" class="captureStatus">先点“开始”，再拍照上传。</p>
+      <label class="bigCameraButton" for="cameraInput">拍照上传</label>
+      <input id="cameraInput" type="file" accept="image/*" capture="environment">
+      <label class="captureButton secondary wide" for="fileInput">从相册选择</label>
+      <input id="fileInput" type="file" accept="image/*" multiple>
+    </section>
+
+    <section class="panel capturePanel hiddenPanel">
+      <label class="field">
+        <span>备注</span>
+        <input id="batchName" type="text" placeholder="例如：白班-01">
+      </label>
+      <button id="createBatchBtn" class="primary wide" type="button">开始</button>
+    </section>
+
+    <section class="panel capturePanel">
+      <div class="sectionTitle">
+        <h2>选择当前批次</h2>
+        <span id="batchHint"></span>
+      </div>
+      <div id="batchList" class="batchList"></div>
+    </section>
+
+  </main>
+
+  <script src="/static/capture.js"></script>
+</body>
+</html>

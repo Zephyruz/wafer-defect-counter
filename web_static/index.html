@@ -10,29 +10,39 @@
   <header class="topbar">
     <div>
       <h1>晶圆缺陷计数</h1>
-      <p>批量上传、手机拍照、四点校准、自动统计</p>
+      <p>固定机位连续拍摄、自动上传、即时统计</p>
     </div>
     <button id="refreshBtn" class="iconButton" title="刷新">↻</button>
   </header>
 
   <main class="layout">
     <section class="panel uploadPanel">
-      <h2>新建批次</h2>
-      <form id="uploadForm">
+      <h2>生产控制</h2>
+      <form id="uploadForm" class="hiddenPanel">
         <label class="field">
-          <span>批次名称</span>
+          <span>备注</span>
           <input id="batchName" name="name" type="text" placeholder="例如：白班-01">
         </label>
         <label class="dropzone" for="fileInput">
           <input id="fileInput" name="files" type="file" accept="image/*" multiple>
-          <strong>选择一批图片</strong>
+          <strong>选择图片</strong>
           <span id="fileCount">支持一次上传多张</span>
         </label>
-        <button class="primary wide" type="submit">上传并创建批次</button>
+        <button class="primary wide" type="submit">上传并开始</button>
       </form>
+      <div class="productionButtons">
+        <button id="startBatchBtn" class="primary wide" type="button">开始</button>
+        <button id="stopBatchBtn" class="wide" type="button">停止并清除</button>
+      </div>
+      <div class="sideCaptureTools">
+        <label class="captureButton wide" for="cameraInput">拍照加入当前批次</label>
+        <input id="cameraInput" type="file" accept="image/*" capture="environment">
+        <label class="captureButton secondary wide" for="appendInput">继续选图加入批次</label>
+        <input id="appendInput" type="file" accept="image/*" multiple>
+      </div>
     </section>
 
-    <section class="panel batchesPanel">
+    <section class="panel batchesPanel hiddenPanel">
       <div class="sectionTitle">
         <h2>批次</h2>
         <span id="batchHint"></span>
@@ -45,39 +55,58 @@
         <div><span>图片</span><strong id="sumImages">0</strong></div>
         <div><span>已完成</span><strong id="sumDone">0</strong></div>
         <div><span>芯片总数</span><strong id="sumTotal">0</strong></div>
+        <div><span>良好芯片</span><strong id="sumGood">0</strong></div>
         <div><span>不良芯片</span><strong id="sumBad">0</strong></div>
         <div><span>不良率</span><strong id="sumRate">0.00%</strong></div>
+      </div>
+
+      <div class="liveStrip">
+        <div><span>当前张 OK</span><strong id="currentOk">0</strong></div>
+        <div><span>当前张 NG</span><strong id="currentNg">0</strong></div>
+        <div><span>当前状态</span><strong id="currentStatus">待拍摄</strong></div>
+        <div><span>点位方式</span><strong id="calibrationStatus">未开始</strong></div>
       </div>
 
       <div class="contentGrid">
         <section class="panel imagePanel">
           <div class="sectionTitle">
             <h2 id="activeTitle">未选择批次</h2>
-            <div class="modeSwitch">
-              <button id="oneMode" class="active" type="button">当前图片</button>
-              <button id="batchMode" type="button">整批复用</button>
+            <div class="modeSwitch hiddenPanel">
+              <button id="oneMode" type="button">当前图片</button>
+              <button id="batchMode" class="active" type="button">保存为本批校准</button>
             </div>
           </div>
 
-          <div class="captureRow">
-            <label class="captureButton" for="cameraInput">拍照加入当前批次</label>
-            <input id="cameraInput" type="file" accept="image/*" capture="environment">
-            <label class="captureButton secondary" for="appendInput">继续选图加入批次</label>
-            <input id="appendInput" type="file" accept="image/*" multiple>
+          <div class="viewTools">
+            <button id="zoomOut" type="button">缩小</button>
+            <button id="zoomReset" type="button">适应窗口</button>
+            <button id="zoomIn" type="button">放大</button>
+            <button id="showOriginal" type="button">原图</button>
+            <button id="showResult" type="button">结果图</button>
+            <span id="zoomLabel">100%</span>
+            <span class="pointOrder">点选顺序：上中 / 右中 / 下中 / 左中</span>
           </div>
-
-          <div class="calibrationHelp">
-            <span>点选顺序：</span>
-            <b>上中</b><b>右中</b><b>下中</b><b>左中</b>
-          </div>
-          <div id="imageStage" class="imageStage">
-            <div class="emptyState">上传或选择一个批次后，在这里点选四个参考芯片中心</div>
-            <img id="mainImage" alt="">
-            <canvas id="pointCanvas"></canvas>
-          </div>
-          <div class="actions">
-            <button id="resetPoints" type="button">重选点</button>
-            <button id="submitPoints" class="primary" type="button">开始统计</button>
+          <div class="imageWorkArea">
+            <div id="imageStage" class="imageStage">
+              <div class="emptyState">上传或选择一个批次后，在这里点选四个参考芯片中心</div>
+              <img id="mainImage" alt="">
+              <canvas id="pointCanvas"></canvas>
+            </div>
+            <div class="sideActionPanel">
+              <div class="actions">
+                <button id="resetPoints" type="button">重选点</button>
+                <button id="excludeCurrent" type="button">作废当前张</button>
+                <button id="submitPoints" class="primary" type="button">预览网格</button>
+              </div>
+              <div id="correctionPanel" class="correctionPanel hiddenPanel">
+                <label>
+                  <span>人工修正 NG</span>
+                  <input id="ngCorrection" type="number" min="-20" max="20" step="1" value="0">
+                </label>
+                <button id="saveCorrection" type="button">保存修正</button>
+                <span id="correctionStatus"></span>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -90,7 +119,7 @@
         </section>
       </div>
 
-      <section class="panel resultPanel">
+      <section class="panel resultPanel hiddenPanel">
         <div class="sectionTitle">
           <h2>结果复查</h2>
           <span id="resultMeta"></span>

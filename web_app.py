@@ -46,7 +46,23 @@ def read_batch(batch_id: str) -> dict:
     path = batch_file(batch_id)
     if not path.exists():
         raise FileNotFoundError(batch_id)
-    return json.loads(path.read_text(encoding="utf-8"))
+    batch = json.loads(path.read_text(encoding="utf-8"))
+    changed = False
+    for image in batch.get("images", []):
+        summary = image.get("summary")
+        if isinstance(summary, dict) and "chips" in summary:
+            summary.pop("chips", None)
+            changed = True
+        if image.get("status") == "processing" and image.get("summary"):
+            image["status"] = "done"
+            changed = True
+        if image.get("status") == "processing" and now_ms() - int(image.get("started_at") or 0) > 10 * 60 * 1000:
+            image["status"] = "failed"
+            image["error"] = "处理超时，请重新点位后再统计"
+            changed = True
+    if changed:
+        write_batch(batch)
+    return batch
 
 
 def write_batch(batch: dict) -> None:
@@ -68,13 +84,28 @@ def list_batches() -> list[dict]:
     return sorted(batches, key=lambda item: item["created_at"], reverse=True)
 
 
+def stop_open_batches() -> None:
+    for path in BATCHES_DIR.glob("*/batch.json"):
+        try:
+            batch = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not batch.get("stopped"):
+            batch["stopped"] = True
+            batch["stopped_at"] = now_ms()
+            write_batch(batch)
+
+
 def batch_summary(batch: dict) -> dict:
     images = batch.get("images", [])
-    done = [image for image in images if image.get("status") == "done"]
+    included = [image for image in images if not image.get("excluded")]
+    done = [image for image in included if image.get("status") == "done"]
     processing = [image for image in images if image.get("status") == "processing"]
-    failed = [image for image in images if image.get("status") == "failed"]
+    failed = [image for image in included if image.get("status") == "failed"]
+    excluded = [image for image in images if image.get("excluded")]
     total_chips = sum(image.get("summary", {}).get("total_chips", 0) for image in done)
-    defective_chips = sum(image.get("summary", {}).get("defective_chips", 0) for image in done)
+    defective_chips = sum(corrected_defective_chips(image) for image in done)
+    good_chips = total_chips - defective_chips
     return {
         "id": batch["id"],
         "name": batch["name"],
@@ -83,10 +114,22 @@ def batch_summary(batch: dict) -> dict:
         "done_count": len(done),
         "processing_count": len(processing),
         "failed_count": len(failed),
+        "excluded_count": len(excluded),
         "total_chips": total_chips,
+        "good_chips": good_chips,
         "defective_chips": defective_chips,
         "defect_rate": defective_chips / total_chips if total_chips else 0,
+        "has_calibration": False,
+        "stopped": bool(batch.get("stopped")),
     }
+
+
+def corrected_defective_chips(image: dict) -> int:
+    summary = image.get("summary") or {}
+    total = int(summary.get("total_chips") or 0)
+    defective = int(summary.get("defective_chips") or 0)
+    delta = int(image.get("manual_ng_delta") or 0)
+    return max(0, min(total, defective + delta))
 
 
 def safe_filename(name: str) -> str:
@@ -97,22 +140,44 @@ def safe_filename(name: str) -> str:
 
 
 def media_url(path: str | Path) -> str:
-    rel = Path(path).resolve().relative_to(DATA_DIR.resolve()).as_posix()
-    return f"/media/{rel}"
+    resolved = Path(path).resolve()
+    rel = resolved.relative_to(DATA_DIR.resolve()).as_posix()
+    version = int(resolved.stat().st_mtime) if resolved.exists() else now_ms()
+    return f"/media/{rel}?v={version}"
 
 
 def image_for_response(image: dict) -> dict:
     copied = dict(image)
     copied["url"] = media_url(image["path"])
+    if copied.get("preview_image"):
+        copied["preview_url"] = media_url(copied["preview_image"])
     summary = copied.get("summary")
     if summary:
         summary = dict(summary)
+        adjusted_defective = corrected_defective_chips(copied)
+        total = int(summary.get("total_chips") or 0)
+        summary["raw_defective_chips"] = int(summary.get("defective_chips") or 0)
+        summary["manual_ng_delta"] = int(copied.get("manual_ng_delta") or 0)
+        summary["defective_chips"] = adjusted_defective
+        summary["good_chips"] = total - adjusted_defective
+        summary["defect_rate"] = adjusted_defective / total if total else 0
         summary["result_url"] = media_url(summary["result_image"])
+        if summary.get("review_image"):
+            summary["review_url"] = media_url(summary["review_image"])
         summary["debug_url"] = media_url(summary["debug_image"])
         if summary.get("chip_report"):
             summary["chip_report_url"] = media_url(summary["chip_report"])
+        summary.pop("chips", None)
         copied["summary"] = summary
     return copied
+
+
+def compact_summary(summary: dict | None) -> dict | None:
+    if not summary:
+        return None
+    compacted = dict(summary)
+    compacted.pop("chips", None)
+    return compacted
 
 
 def add_uploaded_file(batch: dict, file_item) -> dict | None:
@@ -136,19 +201,30 @@ def add_uploaded_file(batch: dict, file_item) -> dict | None:
         "points": None,
         "summary": None,
         "error": None,
+        "excluded": False,
         "created_at": now_ms(),
     }
     batch["images"].append(image)
     return image
 
 
+def queue_images(batch_id: str, image_ids: list[str], points: list[list[float]]) -> None:
+    for image_id in image_ids:
+        executor.submit(process_image, batch_id, image_id, points)
+
+
 def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> None:
     with store_lock:
         batch = read_batch(batch_id)
         image = next(item for item in batch["images"] if item["id"] == image_id)
+        if image.get("excluded"):
+            return
         image["status"] = "processing"
+        image["started_at"] = now_ms()
         image["points"] = points
         image["error"] = None
+        image["manual_ng_delta"] = 0
+        image.pop("corrected_at", None)
         write_batch(batch)
 
     try:
@@ -156,7 +232,7 @@ def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> No
 
         output_dir = batch_dir(batch_id) / "results" / image_id
         summary = process_image_file(Path(image["path"]), points, output_dir)
-        summary_dict = asdict(summary)
+        summary_dict = compact_summary(asdict(summary))
         status = "done"
         error = None
     except Exception as exc:
@@ -167,6 +243,8 @@ def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> No
     with store_lock:
         batch = read_batch(batch_id)
         image = next(item for item in batch["images"] if item["id"] == image_id)
+        if image.get("excluded"):
+            return
         image["status"] = status
         image["summary"] = summary_dict
         image["error"] = error
@@ -175,7 +253,7 @@ def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> No
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "WaferWeb/0.2"
+    server_version = "WaferWeb/0.7"
 
     def log_message(self, format: str, *args) -> None:
         return
@@ -197,6 +275,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/":
             self.serve_file(STATIC_DIR / "index.html")
             return
+        if path == "/capture":
+            self.serve_file(STATIC_DIR / "capture.html")
+            return
         if path.startswith("/static/"):
             self.serve_file(STATIC_DIR / unquote(path.removeprefix("/static/")))
             return
@@ -206,6 +287,15 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/batches":
             self.send_json({"batches": list_batches()})
             return
+        if path == "/api/version":
+            self.send_json({
+                "version": "0.7",
+                "grid_preview": True,
+                "manual_points_per_image": True,
+                "review_image_without_indices": True,
+                "manual_ng_correction": True,
+            })
+            return
         if path.startswith("/api/batches/"):
             batch_id = path.split("/", 3)[3]
             try:
@@ -214,16 +304,32 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_error_json("批次不存在", HTTPStatus.NOT_FOUND)
                 return
             batch = dict(batch)
-            batch["images"] = [image_for_response(image) for image in batch["images"]]
             batch["summary"] = batch_summary(batch)
+            batch["images"] = [image_for_response(image) for image in batch["images"]]
             self.send_json(batch)
             return
         self.send_error_json("页面不存在", HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        parts = parsed.path.strip("/").split("/")
         if parsed.path == "/api/batches":
             self.create_batch()
+            return
+        if len(parts) >= 4 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "stop":
+            self.stop_batch(parts[2])
+            return
+        if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "exclude":
+            self.exclude_image(parts[2], parts[4])
+            return
+        if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "preview":
+            self.preview_grid(parts[2], parts[4])
+            return
+        if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "correction":
+            self.correct_image(parts[2], parts[4])
+            return
+        if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "reset-correction":
+            self.reset_image_correction(parts[2], parts[4])
             return
         if parsed.path.startswith("/api/batches/") and parsed.path.endswith("/images"):
             batch_id = parsed.path.split("/")[3]
@@ -246,19 +352,28 @@ class AppHandler(BaseHTTPRequestHandler):
     def create_batch(self) -> None:
         form = self.read_form()
         name = form.getfirst("name") or time.strftime("批次_%Y%m%d_%H%M%S")
+        allow_empty = form.getfirst("allow_empty") == "1"
         files = form["files"] if "files" in form else []
         if not isinstance(files, list):
             files = [files]
 
-        batch = {"id": uuid.uuid4().hex[:12], "name": name, "created_at": now_ms(), "images": []}
+        batch = {
+            "id": uuid.uuid4().hex[:12],
+            "name": name,
+            "created_at": now_ms(),
+            "calibration_points": None,
+            "stopped": False,
+            "images": [],
+        }
         for file_item in files:
             add_uploaded_file(batch, file_item)
 
-        if not batch["images"]:
+        if not batch["images"] and not allow_empty:
             self.send_error_json("没有收到可用图片")
             return
 
         with store_lock:
+            stop_open_batches()
             write_batch(batch)
         self.send_json({"batch": batch_summary(batch), "id": batch["id"]}, HTTPStatus.CREATED)
 
@@ -268,6 +383,9 @@ class AppHandler(BaseHTTPRequestHandler):
             batch = read_batch(batch_id)
         except FileNotFoundError:
             self.send_error_json("批次不存在", HTTPStatus.NOT_FOUND)
+            return
+        if batch.get("stopped"):
+            self.send_error_json("本批已停止，请先开始新批次")
             return
 
         files = form["files"] if "files" in form else []
@@ -285,6 +403,16 @@ class AppHandler(BaseHTTPRequestHandler):
             write_batch(batch)
         self.send_json({"added": len(added), "image_ids": added}, HTTPStatus.CREATED)
 
+    def stop_batch(self, batch_id: str) -> None:
+        try:
+            batch = read_batch(batch_id)
+        except FileNotFoundError:
+            self.send_error_json("批次不存在", HTTPStatus.NOT_FOUND)
+            return
+        with store_lock:
+            stop_open_batches()
+        self.send_json({"ok": True, "summary": batch_summary(batch)})
+
     def submit_points(self, batch_id: str) -> None:
         try:
             payload = self.read_json_body()
@@ -296,17 +424,88 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error_json("提交内容不完整")
             return
 
-        if mode == "batch":
-            targets = [image["id"] for image in batch["images"] if image.get("status") != "processing"]
-        elif image_id:
+        if image_id:
             targets = [image_id]
         else:
             self.send_error_json("缺少图片")
             return
 
-        for target_id in targets:
-            executor.submit(process_image, batch_id, target_id, points)
+        queue_images(batch_id, targets, points)
         self.send_json({"queued": len(targets)})
+
+    def exclude_image(self, batch_id: str, image_id: str) -> None:
+        try:
+            batch = read_batch(batch_id)
+            image = next(item for item in batch["images"] if item["id"] == image_id)
+        except (FileNotFoundError, StopIteration):
+            self.send_error_json("图片不存在", HTTPStatus.NOT_FOUND)
+            return
+
+        image["excluded"] = True
+        image["status"] = "excluded"
+        image["excluded_at"] = now_ms()
+        with store_lock:
+            write_batch(batch)
+        self.send_json({"ok": True, "summary": batch_summary(batch)})
+
+    def correct_image(self, batch_id: str, image_id: str) -> None:
+        try:
+            payload = self.read_json_body()
+            delta = max(-20, min(20, int(payload.get("delta", 0))))
+            batch = read_batch(batch_id)
+            image = next(item for item in batch["images"] if item["id"] == image_id)
+        except (ValueError, TypeError, json.JSONDecodeError, FileNotFoundError, StopIteration):
+            self.send_error_json("修正内容不完整")
+            return
+
+        if not image.get("summary"):
+            self.send_error_json("当前图片还没有统计结果")
+            return
+
+        image["manual_ng_delta"] = delta
+        image["corrected_at"] = now_ms()
+        with store_lock:
+            write_batch(batch)
+        self.send_json({"ok": True, "summary": batch_summary(batch), "defective_chips": corrected_defective_chips(image)})
+
+    def reset_image_correction(self, batch_id: str, image_id: str) -> None:
+        try:
+            batch = read_batch(batch_id)
+            image = next(item for item in batch["images"] if item["id"] == image_id)
+        except (FileNotFoundError, StopIteration):
+            self.send_error_json("图片不存在", HTTPStatus.NOT_FOUND)
+            return
+
+        image["manual_ng_delta"] = 0
+        image.pop("corrected_at", None)
+        with store_lock:
+            write_batch(batch)
+        self.send_json({"ok": True, "summary": batch_summary(batch)})
+
+    def preview_grid(self, batch_id: str, image_id: str) -> None:
+        try:
+            payload = self.read_json_body()
+            points = payload["points"]
+            batch = read_batch(batch_id)
+            image = next(item for item in batch["images"] if item["id"] == image_id)
+        except (KeyError, json.JSONDecodeError, FileNotFoundError, StopIteration):
+            self.send_error_json("预览内容不完整")
+            return
+
+        try:
+            from wafer_defect_counter import generate_grid_preview_file
+
+            output_dir = batch_dir(batch_id) / "previews" / image_id
+            preview_path = generate_grid_preview_file(Path(image["path"]), points, output_dir)
+        except Exception as exc:
+            self.send_error_json(str(exc))
+            return
+
+        image["preview_image"] = preview_path
+        image["preview_points"] = points
+        with store_lock:
+            write_batch(batch)
+        self.send_json({"preview_url": media_url(preview_path)})
 
     def serve_file(self, path: Path) -> None:
         try:

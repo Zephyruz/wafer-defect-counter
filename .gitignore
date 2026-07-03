@@ -24,3 +24,6 @@ points_*/
 # Local editor/system files
 .DS_Store
 Thumbs.db
+
+# Local manual archives
+存档_*/
