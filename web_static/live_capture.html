@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>实时相机上传</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="capturePage liveCapturePage">
+  <header class="topbar">
+    <div>
+      <h1>实时相机上传</h1>
+      <p>手机固定在支架上，蓝牙遥控按键触发拍照上传</p>
+    </div>
+    <button id="refreshBtn" class="iconButton" title="刷新">↻</button>
+  </header>
+
+  <main class="liveCaptureShell">
+    <section class="panel liveCameraPanel">
+      <div class="liveVideoFrame">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="canvas"></canvas>
+        <div id="cameraOverlay" class="liveOverlay">点“开启相机”开始测试</div>
+      </div>
+
+      <div class="liveControls">
+        <button id="shutterBtn" class="captureButton liveShutterButton" type="button">拍照上传</button>
+        <button id="startCameraBtn" class="primary" type="button">开启相机</button>
+        <button id="createBatchBtn" type="button">新批次</button>
+      </div>
+
+      <label class="liveZoomControl">
+        <span>变焦 <strong id="zoomValue">1.0x</strong></span>
+        <input id="zoomSlider" type="range" min="1" max="4" step="0.1" value="1">
+      </label>
+
+      <div class="liveStatusGrid">
+        <div>
+          <span>当前批次</span>
+          <strong id="activeBatchName">未开始</strong>
+        </div>
+        <div>
+          <span>已上传</span>
+          <strong id="imageCount">0</strong>
+        </div>
+        <div>
+          <span>最近按键</span>
+          <strong id="lastKey">无</strong>
+        </div>
+        <div>
+          <span>状态</span>
+          <strong id="statusText">等待</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel capturePanel">
+      <div class="sectionTitle">
+        <h2>选择当前批次</h2>
+        <span id="batchHint"></span>
+      </div>
+      <label class="field">
+        <span>新批次备注</span>
+        <input id="batchName" type="text" placeholder="例如：白班 01">
+      </label>
+      <div id="batchList" class="batchList"></div>
+    </section>
+  </main>
+
+  <script src="/static/live_capture.js"></script>
+</body>
+</html>

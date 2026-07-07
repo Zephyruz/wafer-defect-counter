@@ -27,3 +27,7 @@ Thumbs.db
 
 # Local manual archives
 存档_*/
+
+# Local HTTPS test certificates
+cert.pem
+key.pem

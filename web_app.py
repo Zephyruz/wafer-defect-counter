@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import cgi
+from email import policy
+from email.parser import BytesParser
 import json
 import mimetypes
-import shutil
+import ssl
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,10 +20,27 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "web_data"
 BATCHES_DIR = DATA_DIR / "batches"
 STATIC_DIR = ROOT / "web_static"
+CERT_FILE = ROOT / "cert.pem"
+KEY_FILE = ROOT / "key.pem"
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 executor = ThreadPoolExecutor(max_workers=2)
 store_lock = threading.Lock()
+
+
+@dataclass
+class UploadedFile:
+    filename: str
+    data: bytes
+
+
+@dataclass
+class ParsedForm:
+    fields: dict[str, str]
+    files: list[UploadedFile]
+
+    def getfirst(self, name: str, default: str | None = None) -> str | None:
+        return self.fields.get(name, default)
 
 
 def now_ms() -> int:
@@ -192,7 +210,7 @@ def add_uploaded_file(batch: dict, file_item) -> dict | None:
     filename = f"{image_id}_{safe_filename(file_item.filename)}"
     target = uploads_dir / filename
     with target.open("wb") as output:
-        shutil.copyfileobj(file_item.file, output)
+        output.write(file_item.data)
     image = {
         "id": image_id,
         "filename": file_item.filename,
@@ -278,6 +296,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/capture":
             self.serve_file(STATIC_DIR / "capture.html")
             return
+        if path == "/live-capture":
+            self.serve_file(STATIC_DIR / "live_capture.html")
+            return
         if path.startswith("/static/"):
             self.serve_file(STATIC_DIR / unquote(path.removeprefix("/static/")))
             return
@@ -346,16 +367,36 @@ class AppHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
 
-    def read_form(self) -> cgi.FieldStorage:
-        return cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
+    def read_form(self) -> ParsedForm:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.startswith("multipart/form-data"):
+            return ParsedForm({}, [])
+
+        header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+        message = BytesParser(policy=policy.default).parsebytes(header + raw)
+        fields: dict[str, str] = {}
+        files: list[UploadedFile] = []
+        for part in message.iter_parts():
+            disposition = part.get("Content-Disposition", "")
+            if "form-data" not in disposition:
+                continue
+            name = part.get_param("name", header="content-disposition")
+            filename = part.get_filename()
+            payload = part.get_payload(decode=True) or b""
+            if filename:
+                files.append(UploadedFile(filename=filename, data=payload))
+            elif name:
+                charset = part.get_content_charset() or "utf-8"
+                fields[name] = payload.decode(charset, errors="replace")
+        return ParsedForm(fields, files)
 
     def create_batch(self) -> None:
         form = self.read_form()
         name = form.getfirst("name") or time.strftime("批次_%Y%m%d_%H%M%S")
         allow_empty = form.getfirst("allow_empty") == "1"
-        files = form["files"] if "files" in form else []
-        if not isinstance(files, list):
-            files = [files]
+        files = form.files
 
         batch = {
             "id": uuid.uuid4().hex[:12],
@@ -388,9 +429,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error_json("本批已停止，请先开始新批次")
             return
 
-        files = form["files"] if "files" in form else []
-        if not isinstance(files, list):
-            files = [files]
+        files = form.files
         added = []
         for file_item in files:
             image = add_uploaded_file(batch, file_item)
@@ -542,13 +581,19 @@ def main() -> None:
     ensure_dirs()
     host = "0.0.0.0"
     port = 8765
+    scheme = "http"
     try:
         server = ThreadingHTTPServer((host, port), AppHandler)
     except OSError:
         port = 8766
         server = ThreadingHTTPServer((host, port), AppHandler)
-    print(f"网站已启动：http://127.0.0.1:{port}")
-    print(f"手机访问：请使用 http://电脑IP:{port}")
+    if CERT_FILE.exists() and KEY_FILE.exists():
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(CERT_FILE, KEY_FILE)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
+    print(f"网站已启动：{scheme}://127.0.0.1:{port}")
+    print(f"手机访问：请使用 {scheme}://电脑IP:{port}")
     server.serve_forever()
 
 

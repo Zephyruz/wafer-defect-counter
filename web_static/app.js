@@ -113,10 +113,15 @@ async function loadBatches() {
 
 async function openBatch(batchId, imageId = null, options = {}) {
   const previousImageId = state.activeImage?.id;
+  const previousImageCount = state.activeBatch?.summary?.image_count ?? state.activeBatch?.images?.length ?? 0;
   state.activeBatch = await api(`/api/batches/${batchId}`);
   const images = state.activeBatch.images || [];
   const latest = [...images].reverse().find((image) => !image.excluded) || images[images.length - 1] || null;
-  const selected = imageId && !options.followLatest ? images.find((image) => image.id === imageId) || latest : latest;
+  const currentImageCount = state.activeBatch?.summary?.image_count ?? images.length;
+  const shouldFollowNewImage = options.followOnNew && currentImageCount > previousImageCount;
+  const selected = (imageId && !options.followLatest && !shouldFollowNewImage)
+    ? images.find((image) => image.id === imageId) || latest
+    : latest;
   state.activeImage = selected;
   if (previousImageId !== selected?.id) {
     state.correctionEditing = false;
@@ -852,6 +857,7 @@ setInterval(() => {
   openBatch(state.activeBatch.id, shouldFollow ? null : state.activeImage?.id, {
     preservePoints: !shouldFollow,
     followLatest: shouldFollow,
+    followOnNew: !activelyPicking,
   }).catch(() => {});
 }, 1500);
 

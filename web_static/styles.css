@@ -427,6 +427,122 @@ h2 { margin: 0; font-size: 17px; }
   display: none;
 }
 
+.liveCaptureShell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 12px;
+  padding: 12px;
+}
+
+.liveCameraPanel {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+
+.liveVideoFrame {
+  position: relative;
+  min-height: 420px;
+  height: calc(100vh - 238px);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0d1419;
+}
+
+.liveVideoFrame video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #0d1419;
+}
+
+.liveVideoFrame canvas {
+  display: none;
+}
+
+.liveOverlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  color: #d7e2e6;
+  text-align: center;
+  background: rgba(13, 20, 25, 0.72);
+}
+
+.liveControls {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.5fr) minmax(120px, 1fr) 100px;
+  gap: 8px;
+}
+
+.liveControls button,
+.liveControls .captureButton {
+  min-height: 48px;
+}
+
+.liveControls .liveShutterButton {
+  min-height: 64px;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.liveZoomControl {
+  display: grid;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.liveZoomControl span {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.liveZoomControl strong {
+  color: var(--ink);
+}
+
+.liveZoomControl input {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.liveStatusGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.liveStatusGrid div {
+  min-height: 64px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.liveStatusGrid span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 5px;
+}
+
+.liveStatusGrid strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 18px;
+}
+
 @media (max-width: 980px) {
   .layout { grid-template-columns: 1fr; }
   .uploadPanel, .batchesPanel, .workspace { grid-column: 1; grid-row: auto; }
@@ -435,6 +551,8 @@ h2 { margin: 0; font-size: 17px; }
   .sideActionPanel { display: grid; grid-template-columns: 1fr; }
   .summaryStrip,
   .liveStrip { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+  .liveCaptureShell { grid-template-columns: 1fr; }
+  .liveVideoFrame { height: 56vh; min-height: 300px; }
 }
 
 @media (max-width: 560px) {
@@ -449,4 +567,8 @@ h2 { margin: 0; font-size: 17px; }
   .correctionPanel { align-items: stretch; flex-direction: column; }
   .correctionPanel input,
   .correctionPanel button { width: 100%; }
+  .liveCaptureShell { padding: 10px; gap: 10px; }
+  .liveControls { grid-template-columns: 1fr; }
+  .liveStatusGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .liveVideoFrame { height: 54vh; min-height: 260px; }
 }
