@@ -6,6 +6,9 @@ const state = {
   lastShotAt: 0,
   zoom: 1,
   hardwareZoom: false,
+  videoDevices: [],
+  selectedDeviceId: "",
+  cameraMode: "rear-hd",
 };
 
 const els = {
@@ -20,6 +23,9 @@ const els = {
   canvas: document.querySelector("#canvas"),
   zoomSlider: document.querySelector("#zoomSlider"),
   zoomValue: document.querySelector("#zoomValue"),
+  cameraSelect: document.querySelector("#cameraSelect"),
+  cameraModeSelect: document.querySelector("#cameraModeSelect"),
+  fallbackInput: document.querySelector("#fallbackInput"),
   cameraOverlay: document.querySelector("#cameraOverlay"),
   activeBatchName: document.querySelector("#activeBatchName"),
   imageCount: document.querySelector("#imageCount"),
@@ -100,6 +106,77 @@ async function createEmptyBatch() {
   await loadBatches();
 }
 
+async function loadCameraDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  state.videoDevices = devices.filter((device) => device.kind === "videoinput");
+  if (state.videoDevices.length) {
+    const pdaBackCamera = state.videoDevices.find((device) => /camera2\s*0/i.test(device.label) && /facing\s*back/i.test(device.label));
+    const backCamera = state.videoDevices.find((device) => /back|rear|environment|后|背/i.test(device.label));
+    const selectedStillExists = state.videoDevices.some((device) => device.deviceId === state.selectedDeviceId);
+    if (!selectedStillExists || (!state.selectedDeviceId && pdaBackCamera)) {
+      state.selectedDeviceId = (pdaBackCamera || backCamera || state.videoDevices[0]).deviceId;
+    }
+  }
+  renderCameraSelect();
+}
+
+function renderCameraSelect() {
+  els.cameraSelect.innerHTML = "";
+  if (!state.videoDevices.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "自动选择";
+    els.cameraSelect.appendChild(option);
+    return;
+  }
+  state.videoDevices.forEach((device, index) => {
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    option.textContent = device.label || `摄像头 ${index + 1}`;
+    option.selected = device.deviceId === state.selectedDeviceId;
+    els.cameraSelect.appendChild(option);
+  });
+}
+
+function cameraConstraints() {
+  if (state.selectedDeviceId) {
+    return [
+      { deviceId: { exact: state.selectedDeviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      { deviceId: { exact: state.selectedDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      { deviceId: { exact: state.selectedDeviceId }, width: { ideal: 640 }, height: { ideal: 480 } },
+    ];
+  }
+
+  const modes = {
+    "rear-hd": [
+      { facingMode: { exact: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+    ],
+    "rear-low": [
+      { facingMode: { exact: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } },
+      { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } },
+    ],
+    front: [
+      { facingMode: { exact: "user" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      { facingMode: { ideal: "user" }, width: { ideal: 640 }, height: { ideal: 480 } },
+    ],
+    "any-low": [
+      { width: { ideal: 640 }, height: { ideal: 480 } },
+      { width: { ideal: 320 }, height: { ideal: 240 } },
+    ],
+    auto: [
+      { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      { width: { ideal: 1280 }, height: { ideal: 720 } },
+      { width: { ideal: 640 }, height: { ideal: 480 } },
+      true,
+    ],
+  };
+  return modes[state.cameraMode] || modes.auto;
+}
+
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error("这个浏览器不支持网页实时相机");
@@ -109,21 +186,35 @@ async function startCamera() {
     state.stream.getTracks().forEach((track) => track.stop());
   }
 
-  state.stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      facingMode: { ideal: "environment" },
-      width: { ideal: 1920 },
-      height: { ideal: 1080 },
-    },
-    audio: false,
-  });
+  let lastError = null;
+  for (const video of cameraConstraints()) {
+    try {
+      state.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!state.stream) throw lastError || new Error("相机开启失败");
 
   els.video.srcObject = state.stream;
   await els.video.play();
+  await waitForVideoReady();
+  await loadCameraDevices();
   setupZoom();
   els.cameraOverlay.classList.add("hiddenPanel");
   setStatus("相机已开启");
   render();
+}
+
+async function waitForVideoReady() {
+  const started = Date.now();
+  while (!videoReady() && Date.now() - started < 1800) {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  if (!videoReady()) {
+    setStatus("相机已打开，但暂时没有画面");
+  }
 }
 
 function stopCamera() {
@@ -178,6 +269,30 @@ async function applyZoom() {
 
 function videoReady() {
   return els.video.videoWidth > 0 && els.video.videoHeight > 0;
+}
+
+async function uploadFiles(files) {
+  if (!files.length) return;
+  if (!activeBatch()) {
+    setStatus("请先创建或选择批次");
+    return;
+  }
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  state.isUploading = true;
+  render();
+  setStatus("正在上传备用照片...");
+  try {
+    await api(`/api/batches/${state.activeBatchId}/images`, { method: "POST", body: form });
+    setStatus("上传完成");
+    await loadBatches();
+  } catch (error) {
+    setStatus("上传失败");
+    alert(error.message);
+  } finally {
+    state.isUploading = false;
+    render();
+  }
 }
 
 async function captureAndUpload(trigger = "button") {
@@ -289,6 +404,39 @@ els.startCameraBtn.addEventListener("click", async () => {
 });
 els.shutterBtn.addEventListener("click", () => captureAndUpload("button"));
 els.zoomSlider.addEventListener("input", applyZoom);
+els.cameraSelect.addEventListener("change", async () => {
+  state.selectedDeviceId = els.cameraSelect.value;
+  if (!state.stream) return;
+  stopCamera();
+  try {
+    await startCamera();
+  } catch (error) {
+    setStatus("相机开启失败");
+    els.cameraOverlay.textContent = error.message;
+    els.cameraOverlay.classList.remove("hiddenPanel");
+  }
+});
+els.cameraModeSelect.addEventListener("change", async () => {
+  state.cameraMode = els.cameraModeSelect.value;
+  state.selectedDeviceId = "";
+  renderCameraSelect();
+  if (!state.stream) return;
+  stopCamera();
+  try {
+    await startCamera();
+  } catch (error) {
+    setStatus("相机开启失败");
+    els.cameraOverlay.textContent = error.message;
+    els.cameraOverlay.classList.remove("hiddenPanel");
+  }
+});
+els.fallbackInput.addEventListener("change", async () => {
+  try {
+    await uploadFiles(els.fallbackInput.files);
+  } finally {
+    els.fallbackInput.value = "";
+  }
+});
 els.createBatchBtn.addEventListener("click", async () => {
   try {
     await createEmptyBatch();
@@ -299,3 +447,4 @@ els.createBatchBtn.addEventListener("click", async () => {
 
 setInterval(loadBatches, 3000);
 loadBatches().catch((error) => alert(error.message));
+loadCameraDevices().catch(() => {});
