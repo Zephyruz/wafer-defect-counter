@@ -23,6 +23,10 @@ STATIC_DIR = ROOT / "web_static"
 CERT_FILE = ROOT / "cert.pem"
 KEY_FILE = ROOT / "key.pem"
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+MAX_UPLOAD_FILES = 10
+MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_REQUEST_BYTES = 120 * 1024 * 1024
+MAX_JSON_REQUEST_BYTES = 2 * 1024 * 1024
 
 executor = ThreadPoolExecutor(max_workers=2)
 store_lock = threading.Lock()
@@ -41,6 +45,14 @@ class ParsedForm:
 
     def getfirst(self, name: str, default: str | None = None) -> str | None:
         return self.fields.get(name, default)
+
+
+class UploadLimitError(ValueError):
+    pass
+
+
+class RequestValidationError(ValueError):
+    pass
 
 
 def now_ms() -> int:
@@ -155,6 +167,46 @@ def safe_filename(name: str) -> str:
     suffix = Path(name).suffix.lower() or ".jpg"
     cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
     return f"{cleaned[:80]}{suffix}"
+
+
+def format_mb(size: int) -> str:
+    return f"{size / 1024 / 1024:.0f} MB"
+
+
+def validate_uploaded_files(files: list[UploadedFile]) -> None:
+    if len(files) > MAX_UPLOAD_FILES:
+        raise UploadLimitError(f"一次最多上传 {MAX_UPLOAD_FILES} 张图片")
+    for file_item in files:
+        size = len(file_item.data)
+        if size > MAX_UPLOAD_FILE_BYTES:
+            raise UploadLimitError(
+                f"{file_item.filename} 太大：{format_mb(size)}，单张最多 {format_mb(MAX_UPLOAD_FILE_BYTES)}"
+            )
+
+
+def parse_content_length(headers, max_bytes: int) -> int:
+    raw = headers.get("Content-Length", "0")
+    try:
+        length = int(raw)
+    except ValueError as exc:
+        raise RequestValidationError("请求长度无效") from exc
+    if length < 0:
+        raise RequestValidationError("请求长度无效")
+    if length > max_bytes:
+        raise UploadLimitError(f"一次上传总量最多 {format_mb(max_bytes)}")
+    return length
+
+
+def resolve_inside(root: Path, path: Path) -> Path:
+    root_resolved = root.resolve()
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise FileNotFoundError from exc
+    if not resolved.is_file():
+        raise FileNotFoundError
+    return resolved
 
 
 def media_url(path: str | Path) -> str:
@@ -281,6 +333,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -363,16 +416,16 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
 
     def read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
+        length = parse_content_length(self.headers, MAX_JSON_REQUEST_BYTES)
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
 
     def read_form(self) -> ParsedForm:
-        length = int(self.headers.get("Content-Length", "0"))
+        length = parse_content_length(self.headers, MAX_UPLOAD_REQUEST_BYTES)
         raw = self.rfile.read(length)
         content_type = self.headers.get("Content-Type", "")
         if not content_type.startswith("multipart/form-data"):
-            return ParsedForm({}, [])
+            raise RequestValidationError("请求格式必须是 multipart/form-data")
 
         header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
         message = BytesParser(policy=policy.default).parsebytes(header + raw)
@@ -390,10 +443,18 @@ class AppHandler(BaseHTTPRequestHandler):
             elif name:
                 charset = part.get_content_charset() or "utf-8"
                 fields[name] = payload.decode(charset, errors="replace")
+        validate_uploaded_files(files)
         return ParsedForm(fields, files)
 
     def create_batch(self) -> None:
-        form = self.read_form()
+        try:
+            form = self.read_form()
+        except UploadLimitError as exc:
+            self.send_error_json(str(exc), HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        except RequestValidationError as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
         name = form.getfirst("name") or time.strftime("批次_%Y%m%d_%H%M%S")
         allow_empty = form.getfirst("allow_empty") == "1"
         files = form.files
@@ -421,6 +482,13 @@ class AppHandler(BaseHTTPRequestHandler):
     def add_images(self, batch_id: str) -> None:
         try:
             form = self.read_form()
+        except UploadLimitError as exc:
+            self.send_error_json(str(exc), HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        except RequestValidationError as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
+        try:
             batch = read_batch(batch_id)
         except FileNotFoundError:
             self.send_error_json("批次不存在", HTTPStatus.NOT_FOUND)
@@ -459,6 +527,12 @@ class AppHandler(BaseHTTPRequestHandler):
             mode = payload.get("mode", "one")
             image_id = payload.get("image_id")
             batch = read_batch(batch_id)
+        except UploadLimitError as exc:
+            self.send_error_json(str(exc), HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        except RequestValidationError as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
         except (KeyError, json.JSONDecodeError, FileNotFoundError):
             self.send_error_json("提交内容不完整")
             return
@@ -493,6 +567,12 @@ class AppHandler(BaseHTTPRequestHandler):
             delta = max(-20, min(20, int(payload.get("delta", 0))))
             batch = read_batch(batch_id)
             image = next(item for item in batch["images"] if item["id"] == image_id)
+        except UploadLimitError as exc:
+            self.send_error_json(str(exc), HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        except RequestValidationError as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
         except (ValueError, TypeError, json.JSONDecodeError, FileNotFoundError, StopIteration):
             self.send_error_json("修正内容不完整")
             return
@@ -527,6 +607,12 @@ class AppHandler(BaseHTTPRequestHandler):
             points = payload["points"]
             batch = read_batch(batch_id)
             image = next(item for item in batch["images"] if item["id"] == image_id)
+        except UploadLimitError as exc:
+            self.send_error_json(str(exc), HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        except RequestValidationError as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
         except (KeyError, json.JSONDecodeError, FileNotFoundError, StopIteration):
             self.send_error_json("预览内容不完整")
             return
@@ -548,9 +634,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def serve_file(self, path: Path) -> None:
         try:
-            resolved = path.resolve()
-            if STATIC_DIR.resolve() not in resolved.parents and resolved != STATIC_DIR.resolve() / "index.html":
-                raise FileNotFoundError
+            resolved = resolve_inside(STATIC_DIR, path)
             body = resolved.read_bytes()
         except OSError:
             self.send_error_json("文件不存在", HTTPStatus.NOT_FOUND)
@@ -559,20 +643,24 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def serve_media(self, rel_path: str) -> None:
         try:
-            resolved = (DATA_DIR / unquote(rel_path)).resolve()
-            if DATA_DIR.resolve() not in resolved.parents:
-                raise FileNotFoundError
+            resolved = resolve_inside(DATA_DIR, DATA_DIR / unquote(rel_path))
             body = resolved.read_bytes()
         except OSError:
             self.send_error_json("图片不存在", HTTPStatus.NOT_FOUND)
             return
         self.send_bytes(resolved, body)
 
+    def send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+
     def send_bytes(self, path: Path, body: bytes) -> None:
         content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
