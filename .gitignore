@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+.venv/
+.venv_old/
+offline_packages/
 
 # Input photos and generated outputs
 *.jpg
