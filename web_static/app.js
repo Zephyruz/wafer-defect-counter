@@ -7,6 +7,9 @@ const state = {
   followLatest: true,
   previewReady: false,
   previewUrl: "",
+  previewAuto: false,
+  manualMode: false,
+  autoRequested: false,
   imageMode: "auto",
   correctionEditing: false,
   correctionImageId: null,
@@ -37,6 +40,7 @@ const els = {
   imageStage: document.querySelector("#imageStage"),
   pointStatus: document.querySelector("#pointStatus"),
   resetPoints: document.querySelector("#resetPoints"),
+  manualCalibrate: document.querySelector("#manualCalibrate"),
   excludeCurrent: document.querySelector("#excludeCurrent"),
   submitPoints: document.querySelector("#submitPoints"),
   zoomOut: document.querySelector("#zoomOut"),
@@ -92,6 +96,9 @@ async function loadBatches() {
     state.points = [];
     state.previewReady = false;
     state.previewUrl = "";
+    state.previewAuto = false;
+    state.manualMode = false;
+    state.autoRequested = false;
     state.imageMode = "auto";
   }
   if (!state.activeBatch) {
@@ -134,6 +141,9 @@ async function openBatch(batchId, imageId = null, options = {}) {
     state.points = [];
     state.previewReady = false;
     state.previewUrl = "";
+    state.previewAuto = false;
+    state.manualMode = false;
+    state.autoRequested = false;
     state.imageMode = "auto";
   }
   renderAll();
@@ -195,7 +205,7 @@ function renderSummary() {
   els.sumGood.textContent = summary.good_chips || 0;
   els.sumBad.textContent = summary.defective_chips || 0;
   els.sumRate.textContent = formatRate(summary.defect_rate);
-  els.calibrationStatus.textContent = state.activeBatch ? "每张手动" : "未开始";
+  els.calibrationStatus.textContent = state.activeBatch ? "自动定位" : "未开始";
 }
 
 function statusText(status) {
@@ -235,6 +245,9 @@ function renderImages() {
       state.points = [];
       state.previewReady = false;
       state.previewUrl = "";
+      state.previewAuto = false;
+      state.manualMode = false;
+      state.autoRequested = false;
       state.imageMode = "auto";
       clearCorrectionEditing(image.id);
       renderActiveImage();
@@ -266,8 +279,16 @@ function renderActiveImage() {
     resetView();
   }
   els.pointStatus.textContent = `${state.points.length}/4`;
+  els.submitPoints.textContent = submitPointsLabel();
   applyView();
   drawPoints();
+  maybeRequestAutoPreview();
+}
+
+function submitPointsLabel() {
+  if (state.activeImage?.summary) return "确认网格并统计";
+  if (state.previewReady) return "确认网格并统计";
+  return state.manualMode ? "预览网格" : "自动统计";
 }
 
 function clampZoom(value) {
@@ -298,6 +319,7 @@ function zoomBy(factor) {
 
 function canAddPoint() {
   if (!state.activeImage || !els.mainImage.naturalWidth) return false;
+  if (!state.manualMode) return false;
   if (state.points.length >= 4) return false;
   if (state.previewUrl) return false;
   if (state.activeImage.summary && state.imageMode !== "original") return false;
@@ -310,8 +332,9 @@ function undoLastPoint() {
   state.points.pop();
   state.previewReady = false;
   state.previewUrl = "";
+  state.previewAuto = false;
   state.imageMode = "original";
-  els.submitPoints.textContent = "预览网格";
+  els.submitPoints.textContent = submitPointsLabel();
   renderActiveImage();
   renderResults();
 }
@@ -395,16 +418,49 @@ async function requestGridPreview() {
     });
     state.previewReady = true;
     state.previewUrl = payload.preview_url;
+    state.previewAuto = false;
     els.submitPoints.textContent = "确认网格并统计";
     renderActiveImage();
     renderResults();
   } catch (error) {
     state.previewReady = false;
     state.previewUrl = "";
-    els.submitPoints.textContent = "预览网格";
+    els.submitPoints.textContent = submitPointsLabel();
     alert(error.message);
   } finally {
     els.submitPoints.disabled = false;
+  }
+}
+
+async function maybeRequestAutoPreview() {
+  if (state.manualMode) return;
+  if (state.previewReady || state.previewUrl) return;
+  if (state.autoRequested) return;
+  const image = state.activeImage;
+  if (!image || !state.activeBatch) return;
+  if (image.summary) return;
+  if (image.status !== "waiting_points") return;
+  if (!els.mainImage.naturalWidth) return;
+  state.autoRequested = true;
+  try {
+    const payload = await api(`/api/batches/${state.activeBatch.id}/images/${image.id}/auto-preview`, {
+      method: "POST",
+    });
+    state.previewReady = true;
+    state.previewUrl = payload.preview_url;
+    state.previewAuto = true;
+    els.submitPoints.textContent = "确认网格并统计";
+    renderActiveImage();
+    renderResults();
+  } catch (error) {
+    state.previewReady = false;
+    state.previewUrl = "";
+    state.previewAuto = false;
+    els.submitPoints.textContent = submitPointsLabel();
+    // Auto failed: hint user to switch to manual 4-point calibration.
+    els.pointStatus.textContent = `自动定位失败：${error.message}（可点“手动 4 点校准”）`;
+  } finally {
+    state.autoRequested = false;
   }
 }
 
@@ -658,13 +714,15 @@ async function resetCurrentPoints() {
   state.points = [];
   state.previewReady = false;
   state.previewUrl = "";
+  state.previewAuto = false;
+  state.autoRequested = false;
   state.imageMode = "original";
   clearCorrectionEditing();
   state.repointingImageId = state.activeImage?.id || null;
   state.repointingAt = Date.now();
   els.ngCorrection.value = 0;
   els.correctionStatus.textContent = "";
-  els.submitPoints.textContent = "预览网格";
+  els.submitPoints.textContent = submitPointsLabel();
   renderActiveImage();
   drawPoints();
   renderResults();
@@ -690,16 +748,40 @@ els.resetPoints.addEventListener("click", () => {
   resetCurrentPoints();
 });
 
+function enterManualCalibration() {
+  if (!state.activeBatch || !state.activeImage) return;
+  state.followLatest = false;
+  state.manualMode = true;
+  state.previewReady = false;
+  state.previewUrl = "";
+  state.previewAuto = false;
+  state.points = [];
+  state.imageMode = "original";
+  els.submitPoints.textContent = submitPointsLabel();
+  els.pointStatus.textContent = "0/4 手动模式";
+  renderActiveImage();
+  drawPoints();
+  renderResults();
+}
+
+els.manualCalibrate.addEventListener("click", () => {
+  enterManualCalibration();
+});
+
 els.submitPoints.addEventListener("click", async () => {
   if (!state.activeBatch || !state.activeImage) {
     alert("请先选择图片");
     return;
   }
-  if (state.points.length !== 4) {
-    alert("需要按顺序点满四个点");
+  if (!state.previewAuto && state.points.length !== 4) {
+    alert("需要按顺序点满四个点，或等待自动定位");
     return;
   }
   if (!state.previewReady) {
+    if (state.previewAuto || state.manualMode === false) {
+      // Should not normally reach here; auto preview fires on image load.
+      return;
+    }
     await requestGridPreview();
     return;
   }
@@ -708,15 +790,19 @@ els.submitPoints.addEventListener("click", async () => {
   try {
     const batchId = state.activeBatch.id;
     const imageId = state.activeImage.id;
+    const body = state.previewAuto
+      ? { image_id: imageId, points: null }
+      : { image_id: imageId, points: state.points, mode: "one" };
     await api(`/api/batches/${batchId}/points`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image_id: imageId, points: state.points, mode: "one" }),
+      body: JSON.stringify(body),
     });
     state.followLatest = false;
     clearCorrectionEditing(imageId);
     state.previewReady = false;
     state.previewUrl = "";
+    state.previewAuto = false;
     state.imageMode = "result";
     await waitForImageResult(batchId, imageId);
     await loadBatches();
@@ -724,7 +810,7 @@ els.submitPoints.addEventListener("click", async () => {
     alert(error.message);
   } finally {
     els.submitPoints.disabled = false;
-    els.submitPoints.textContent = state.activeImage?.summary ? "确认网格并统计" : "预览网格";
+    els.submitPoints.textContent = submitPointsLabel();
   }
 });
 
@@ -833,6 +919,7 @@ els.refreshBtn.addEventListener("click", loadBatches);
 els.mainImage.addEventListener("load", () => {
   applyView();
   drawPoints();
+  maybeRequestAutoPreview();
 });
 window.addEventListener("resize", drawPoints);
 window.addEventListener("keydown", (event) => {

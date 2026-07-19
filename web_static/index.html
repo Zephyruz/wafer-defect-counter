@@ -84,19 +84,20 @@
             <button id="showOriginal" type="button">原图</button>
             <button id="showResult" type="button">结果图</button>
             <span id="zoomLabel">100%</span>
-            <span class="pointOrder">点选顺序：上中 / 右中 / 下中 / 左中</span>
+            <span class="pointOrder">自动定位；对不准可点“手动 4 点校准”</span>
           </div>
           <div class="imageWorkArea">
             <div id="imageStage" class="imageStage">
-              <div class="emptyState">上传或选择一个批次后，在这里点选四个参考芯片中心</div>
+              <div class="emptyState">上传或选择一个批次后，自动定位晶圆网格</div>
               <img id="mainImage" alt="">
               <canvas id="pointCanvas"></canvas>
             </div>
             <div class="sideActionPanel">
               <div class="actions">
+                <button id="manualCalibrate" type="button">手动 4 点校准</button>
                 <button id="resetPoints" type="button">重选点</button>
                 <button id="excludeCurrent" type="button">作废当前张</button>
-                <button id="submitPoints" class="primary" type="button">预览网格</button>
+                <button id="submitPoints" class="primary" type="button">自动统计</button>
               </div>
               <div id="correctionPanel" class="correctionPanel hiddenPanel">
                 <label>

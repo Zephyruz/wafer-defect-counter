@@ -278,12 +278,12 @@ def add_uploaded_file(batch: dict, file_item) -> dict | None:
     return image
 
 
-def queue_images(batch_id: str, image_ids: list[str], points: list[list[float]]) -> None:
+def queue_images(batch_id: str, image_ids: list[str], points: list[list[float]] | None) -> None:
     for image_id in image_ids:
         executor.submit(process_image, batch_id, image_id, points)
 
 
-def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> None:
+def process_image(batch_id: str, image_id: str, points: list[list[float]] | None) -> None:
     with store_lock:
         batch = read_batch(batch_id)
         image = next(item for item in batch["images"] if item["id"] == image_id)
@@ -292,6 +292,7 @@ def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> No
         image["status"] = "processing"
         image["started_at"] = now_ms()
         image["points"] = points
+        image["auto"] = points is None
         image["error"] = None
         image["manual_ng_delta"] = 0
         image.pop("corrected_at", None)
@@ -363,9 +364,10 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/version":
             self.send_json({
-                "version": "0.7",
+                "version": "0.8",
                 "grid_preview": True,
                 "manual_points_per_image": True,
+                "auto_geometry": True,
                 "review_image_without_indices": True,
                 "manual_ng_correction": True,
             })
@@ -398,6 +400,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "preview":
             self.preview_grid(parts[2], parts[4])
+            return
+        if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "auto-preview":
+            self.auto_preview_grid(parts[2], parts[4])
             return
         if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "correction":
             self.correct_image(parts[2], parts[4])
@@ -523,8 +528,9 @@ class AppHandler(BaseHTTPRequestHandler):
     def submit_points(self, batch_id: str) -> None:
         try:
             payload = self.read_json_body()
-            points = payload["points"]
-            mode = payload.get("mode", "one")
+            points = payload.get("points")
+            if points is not None:
+                points = [[float(p[0]), float(p[1])] for p in points]
             image_id = payload.get("image_id")
             batch = read_batch(batch_id)
         except UploadLimitError as exc:
@@ -535,6 +541,10 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         except (KeyError, json.JSONDecodeError, FileNotFoundError):
             self.send_error_json("提交内容不完整")
+            return
+
+        if points is not None and len(points) != 4:
+            self.send_error_json("需要四个参考芯片中心点，或省略 points 走自动定位")
             return
 
         if image_id:
@@ -631,6 +641,30 @@ class AppHandler(BaseHTTPRequestHandler):
         with store_lock:
             write_batch(batch)
         self.send_json({"preview_url": media_url(preview_path)})
+
+    def auto_preview_grid(self, batch_id: str, image_id: str) -> None:
+        try:
+            batch = read_batch(batch_id)
+            image = next(item for item in batch["images"] if item["id"] == image_id)
+        except (FileNotFoundError, StopIteration):
+            self.send_error_json("图片不存在", HTTPStatus.NOT_FOUND)
+            return
+
+        try:
+            from wafer_defect_counter import generate_grid_preview_auto
+
+            output_dir = batch_dir(batch_id) / "previews" / image_id
+            preview_path = generate_grid_preview_auto(Path(image["path"]), output_dir)
+        except Exception as exc:
+            self.send_error_json(str(exc))
+            return
+
+        image["preview_image"] = preview_path
+        image["preview_points"] = None
+        image["auto"] = True
+        with store_lock:
+            write_batch(batch)
+        self.send_json({"preview_url": media_url(preview_path), "auto": True})
 
     def serve_file(self, path: Path) -> None:
         try:

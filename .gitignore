@@ -34,3 +34,5 @@ Thumbs.db
 # Local HTTPS test certificates
 cert.pem
 key.pem
+.ttadk/
+specs/doc_export/

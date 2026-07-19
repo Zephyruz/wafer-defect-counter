@@ -40,6 +40,19 @@ TOTAL_EXPECTED_CHIPS = sum(ROW_COUNTS)
 REFERENCE_POINT_NAMES = ["上方中间芯片中心", "右侧中间芯片中心", "下方中间芯片中心", "左侧中间芯片中心"]
 
 
+class AutoDetectFailed(RuntimeError):
+    """Raised when automatic wafer geometry detection cannot locate the grid with enough confidence."""
+
+
+def _with_grid_refine_enabled(cfg: Config) -> Config:
+    """Return a copy of cfg with grid refinement turned on for auto calibration."""
+    refined = Config()
+    for field in refined.__dataclass_fields__:
+        setattr(refined, field, getattr(cfg, field))
+    refined.refine_grid = True
+    return refined
+
+
 @dataclass
 class Config:
     """晶圆计数相关阈值和几何参数。"""
@@ -81,6 +94,13 @@ class Config:
     blue_missing_fraction: float = 0.18
     low_texture_std_max: float = 18.0
     missing_value_min: int = 35
+
+    # Auto geometry detection (replaces manual 4-point calibration)
+    auto_detect_min_score: float = 6.0
+    auto_detect_angle_range_deg: float = 12.0
+    auto_detect_angle_step_deg: float = 1.0
+    auto_detect_min_radius_fraction: float = 0.25
+    auto_detect_disk_min_area_fraction: float = 0.15
 
     # Visualization
     normal_color: tuple[int, int, int] = (40, 210, 40)
@@ -335,6 +355,108 @@ def rotate_points(points: np.ndarray, angle_deg: float) -> np.ndarray:
     theta = math.radians(angle_deg)
     rot = np.array([[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]], dtype=np.float32)
     return points @ rot.T
+
+
+def _detect_wafer_disk(image: np.ndarray, cfg: Config) -> tuple[tuple[float, float], float, np.ndarray]:
+    """Locate the wafer disk via the surrounding blue tape ring.
+
+    Returns (center_xy, radius, disk_mask). The disk mask covers the chip-filled
+    wafer interior; the blue tape ring is excluded so it does not skew the fit.
+    """
+    features = build_image_features(image, cfg)
+    blue = features.blue
+    image_area = float(image.shape[0] * image.shape[1])
+
+    # Dilate blue tape so the chip-filled interior becomes a solid hole we can fill.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    filled = cv2.morphologyEx(cv2.bitwise_not(blue), cv2.MORPH_CLOSE, kernel)
+    # Flood-fill from the image corners (background) to label outside-tape regions.
+    flood = filled.copy()
+    h, w = filled.shape[:2]
+    mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    for seed in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]:
+        cv2.floodFill(flood, mask, seed, 0)
+    disk_mask = (flood > 0).astype(np.uint8) * 255
+    disk_mask = cv2.morphologyEx(disk_mask, cv2.MORPH_OPEN, kernel)
+
+    disk_area = float(cv2.countNonZero(disk_mask))
+    if disk_area < image_area * cfg.auto_detect_disk_min_area_fraction:
+        # Fallback: largest bright/gray contour when blue tape ring is weak.
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (0, 0), 6)
+        _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        disk_mask = binary
+        disk_area = float(cv2.countNonZero(disk_mask))
+        if disk_area < image_area * cfg.auto_detect_disk_min_area_fraction:
+            raise AutoDetectFailed(f"未找到晶圆圆盘，蓝膜/圆盘面积占比过小（{disk_area / image_area:.2%}）。")
+
+    contours, _ = cv2.findContours(disk_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise AutoDetectFailed("圆盘掩膜没有轮廓。")
+    largest = max(contours, key=cv2.contourArea)
+    (cx, cy), radius = cv2.minEnclosingCircle(largest)
+
+    min_radius = min(image.shape[0], image.shape[1]) * cfg.auto_detect_min_radius_fraction
+    if radius < min_radius:
+        raise AutoDetectFailed(f"圆盘半径过小（{radius:.0f}px < {min_radius:.0f}px）。")
+
+    return (float(cx), float(cy)), float(radius), disk_mask
+
+
+def auto_detect_geometry(image: np.ndarray, cfg: Config) -> tuple[WaferGeometry, float]:
+    """Detect wafer grid geometry (center, angle, pitch) from the image alone.
+
+    Replaces manual 4-point calibration. Returns (geometry, confidence) where
+    confidence is the final grid-alignment score. Raises AutoDetectFailed when
+    the wafer disk or grid cannot be located confidently — callers fall back to
+    manual 4-point input.
+    """
+    (cx, cy), radius, _disk_mask = _detect_wafer_disk(image, cfg)
+
+    rows = len(ROW_COUNTS)
+    max_cols = max(ROW_COUNTS)
+    # Disk diameter spans 23 chips (middle row has 23 cols; 23 rows tall).
+    diameter = radius * 2.0
+    pitch = diameter / max_cols
+    base_width = pitch * max_cols
+    base_height = pitch * rows
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    response = cv2.GaussianBlur(255 - gray, (3, 3), 0)
+
+    center = np.array([cx, cy], dtype=np.float32)
+    best_angle = 0.0
+    best_score = -1.0
+    step = cfg.auto_detect_angle_step_deg
+    span = cfg.auto_detect_angle_range_deg
+    angle = -span
+    while angle <= span + 1e-6:
+        candidate = WaferGeometry(
+            center=center,
+            width=float(base_width),
+            height=float(base_height),
+            angle_deg=float(angle),
+        )
+        score = grid_alignment_score(response, candidate)
+        if score > best_score:
+            best_score = score
+            best_angle = angle
+        angle += step
+
+    geometry = WaferGeometry(
+        center=center,
+        width=float(base_width),
+        height=float(base_height),
+        angle_deg=float(best_angle),
+    )
+
+    if best_score < cfg.auto_detect_min_score:
+        raise AutoDetectFailed(
+            f"自动网格定位置信度不足（分数 {best_score:.1f} < {cfg.auto_detect_min_score}），请改用手动 4 点校准。"
+        )
+
+    return geometry, float(best_score)
 
 
 def generate_chip_cells(geometry: WaferGeometry, cfg: Config) -> list[ChipCell]:
@@ -661,6 +783,31 @@ def analyze_image_manual(
     return results, geometry, debug_masks, warped, inverse
 
 
+def analyze_image_auto(
+    image: np.ndarray,
+    cfg: Config,
+) -> tuple[list[ChipResult], WaferGeometry, dict[str, np.ndarray], np.ndarray, np.ndarray | None]:
+    """Auto-calibration variant of analyze_image_manual.
+
+    Detects wafer geometry from the image alone (no 4-point input). Cells are
+    generated directly in the original image coordinate system, so the inverse
+    transform is None and downstream transform_* helpers pass coordinates through.
+    """
+    geometry, grid_score = auto_detect_geometry(image, cfg)
+    refine_cfg = _with_grid_refine_enabled(cfg)
+    geometry, refined_score = refine_grid_geometry(image, geometry, refine_cfg)
+    cells = generate_chip_cells(geometry, cfg)
+    features = build_image_features(image, cfg)
+    results = [evaluate_chip(image, cell, cfg, features) for cell in cells]
+    debug_masks = {
+        "warped": image,
+        "manual_points": None,
+        "perspective_matrix": None,
+        "grid_alignment_score": refined_score if refined_score > 0 else grid_score,
+    }
+    return results, geometry, debug_masks, image, None
+
+
 def draw_label(
     image: np.ndarray,
     text: str,
@@ -835,14 +982,17 @@ def find_points_file(points_dir: Path, image_path: Path) -> Path:
 
 def process_one_image(
     image_path: Path,
-    points: np.ndarray,
+    points: np.ndarray | None,
     cfg: Config,
     out_path: Path,
     debug_path: Path,
     report_path: Path | None,
 ) -> list[ChipResult]:
     image = load_image(image_path)
-    results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, points, cfg)
+    if points is None:
+        results, geometry, debug_masks, _warped, cell_to_image = analyze_image_auto(image, cfg)
+    else:
+        results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, points, cfg)
     if len(results) != TOTAL_EXPECTED_CHIPS:
         raise RuntimeError(f"内部布局错误：预期 {TOTAL_EXPECTED_CHIPS} 个芯片，实际 {len(results)} 个。")
 
@@ -895,14 +1045,25 @@ def process_batch(args: argparse.Namespace, cfg: Config) -> None:
     for image_path in image_paths:
         points_path = find_points_file(points_dir, image_path)
         print(f"\n处理：{image_path.name}")
-        if points_path.exists():
+        points: np.ndarray | None = None
+        if not args.auto and points_path.exists():
             points = load_points(points_path)
             print(f"已读取点位：{points_path}")
+        elif args.auto:
+            print("使用自动网格定位。")
         else:
-            image = load_image(image_path)
-            points = collect_manual_points(image, cfg)
-            save_points(points_path, points)
-            print(f"已保存点位：{points_path}")
+            # No saved points and not --auto: try auto first, fall back to manual 4-point.
+            try:
+                image = load_image(image_path)
+                _ = auto_detect_geometry(image, cfg)
+                points = None
+                print("自动网格定位可用。")
+            except AutoDetectFailed as exc:
+                print(f"自动定位失败：{exc}；改为人工点击 4 点。")
+                image = load_image(image_path)
+                points = collect_manual_points(image, cfg)
+                save_points(points_path, points)
+                print(f"已保存点位：{points_path}")
 
         stem = image_path.stem
         out_path = output_dir / f"result{stem}.png"
@@ -939,20 +1100,26 @@ def process_batch(args: argparse.Namespace, cfg: Config) -> None:
 
 def process_image_file(
     image_path: Path,
-    points: list[list[float]] | np.ndarray,
+    points: list[list[float]] | np.ndarray | None,
     output_dir: Path,
     cfg: Config | None = None,
 ) -> ImageAnalysisSummary:
-    """Analyze one image from a web/API caller without opening manual UI windows."""
+    """Analyze one image from a web/API caller without opening manual UI windows.
+
+    When points is None, auto-detects wafer geometry from the image; otherwise
+    falls back to manual 4-point calibration.
+    """
     cfg = cfg or Config()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image = load_image(image_path)
-    point_array = np.array(points, dtype=np.float32)
-    if point_array.shape != (4, 2):
-        raise ValueError("points must contain four [x, y] coordinates")
-
-    results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, point_array, cfg)
+    if points is None:
+        results, geometry, debug_masks, _warped, cell_to_image = analyze_image_auto(image, cfg)
+    else:
+        point_array = np.array(points, dtype=np.float32)
+        if point_array.shape != (4, 2):
+            raise ValueError("points must contain four [x, y] coordinates")
+        results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, point_array, cfg)
     if len(results) != TOTAL_EXPECTED_CHIPS:
         raise RuntimeError(f"Expected {TOTAL_EXPECTED_CHIPS} chips, got {len(results)}")
 
@@ -1020,6 +1187,40 @@ def generate_grid_preview_file(
     return str(preview_path)
 
 
+def generate_grid_preview_auto(
+    image_path: Path,
+    output_dir: Path,
+    cfg: Config | None = None,
+) -> str:
+    """Generate an auto-detected grid preview (no manual 4-point input)."""
+    cfg = cfg or Config()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image = load_image(image_path)
+    geometry, score = auto_detect_geometry(image, cfg)
+
+    cells = generate_chip_cells(geometry, cfg)
+    out = image.copy()
+    rect = (tuple(geometry.center), (geometry.width, geometry.height), geometry.angle_deg)
+    outer = transform_polygon(cv2.boxPoints(rect).astype(np.int32), None)
+    cv2.polylines(out, [outer], True, cfg.grid_color, 3, cv2.LINE_AA)
+    for cell in cells:
+        polygon = transform_polygon(cell_polygon(cell), None)
+        cv2.polylines(out, [polygon], True, cfg.grid_color, 1, cv2.LINE_AA)
+
+    draw_text(
+        out,
+        f"自动网格预览：分数 {score:.1f}，角度 {geometry.angle_deg:.1f} 度；对不准请用手动 4 点",
+        (18, 14),
+        cfg,
+        size=26,
+        color=(255, 220, 100),
+    )
+    preview_path = output_dir / f"{image_path.stem}_grid_preview.jpg"
+    save_image(preview_path, out)
+    return str(preview_path)
+
+
 def apply_detection_preset(cfg: Config, preset: str) -> None:
     """Apply coarse threshold presets before per-parameter CLI overrides."""
     if preset == "sensitive":
@@ -1049,6 +1250,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refine-grid", action="store_true", help="实验功能：自动微调网格中心和间距。默认关闭。")
     parser.add_argument("--no-refine-grid", action="store_true", help="兼容旧参数：保持关闭网格自动微调。")
     parser.add_argument("--points", type=Path, default=None, help="读取已保存的四个参考芯片中心点，跳过人工点击。")
+    parser.add_argument("--auto", action="store_true", help="自动定位网格，不弹窗、不读 4 点；失败时报错退出。")
     parser.add_argument("--save-points", type=Path, default=None, help="保存本次人工点击的四个参考芯片中心点。")
     parser.add_argument(
         "--detection-preset",
@@ -1097,17 +1299,20 @@ def main() -> None:
         raise SystemExit("请提供一张图片，或使用 --batch-dir 指定批量处理文件夹。")
 
     image = load_image(args.image)
-    print("当前模式：人工参考芯片中心校准。")
-    if args.points:
-        points = load_points(args.points)
-        print(f"已读取校准点：{args.points}")
+    if args.auto:
+        print("当前模式：自动网格定位（无需点 4 点）。")
+        results, geometry, debug_masks, warped, cell_to_image = analyze_image_auto(image, cfg)
     else:
-        points = collect_manual_points(image, cfg)
-        if args.save_points:
-            save_points(args.save_points, points)
-            print(f"已保存校准点：{args.save_points}")
-
-    results, geometry, debug_masks, warped, cell_to_image = analyze_image_manual(image, points, cfg)
+        print("当前模式：人工参考芯片中心校准。")
+        if args.points:
+            points = load_points(args.points)
+            print(f"已读取校准点：{args.points}")
+        else:
+            points = collect_manual_points(image, cfg)
+            if args.save_points:
+                save_points(args.save_points, points)
+                print(f"已保存校准点：{args.save_points}")
+        results, geometry, debug_masks, warped, cell_to_image = analyze_image_manual(image, points, cfg)
 
     if len(results) != TOTAL_EXPECTED_CHIPS:
         raise RuntimeError(f"内部布局错误：预期 {TOTAL_EXPECTED_CHIPS} 个芯片，实际 {len(results)} 个。")
