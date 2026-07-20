@@ -2,7 +2,10 @@ __pycache__/
 *.pyc
 .venv/
 .venv_old/
+.venv_win7/
 offline_packages/
+win7_offline_bundle/
+win7_deployment_*.zip
 
 # Input photos and generated outputs
 *.jpg

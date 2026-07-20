@@ -353,10 +353,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self.serve_file(STATIC_DIR / "live_capture.html")
             return
         if path.startswith("/static/"):
-            self.serve_file(STATIC_DIR / unquote(path.removeprefix("/static/")))
+            self.serve_file(STATIC_DIR / unquote(path[len("/static/"):]))
             return
         if path.startswith("/media/"):
-            self.serve_media(path.removeprefix("/media/"))
+            self.serve_media(path[len("/media/"):])
             return
         if path == "/api/batches":
             self.send_json({"batches": list_batches()})
