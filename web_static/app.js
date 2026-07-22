@@ -15,6 +15,7 @@ const state = {
   correctionImageId: null,
   repointingImageId: null,
   repointingAt: 0,
+  openBatchRequestId: 0,
   view: {
     zoom: 1,
     panX: 0,
@@ -92,6 +93,8 @@ async function api(path, options = {}) {
 }
 
 function clearActiveBatchState() {
+  // Any batch request that started before this reset must not restore stale UI state.
+  state.openBatchRequestId += 1;
   state.activeBatch = null;
   state.activeImage = null;
   state.points = [];
@@ -136,9 +139,12 @@ async function loadBatches() {
 }
 
 async function openBatch(batchId, imageId = null, options = {}) {
+  const requestId = ++state.openBatchRequestId;
   const previousImageId = state.activeImage?.id;
   const previousImageCount = state.activeBatch?.summary?.image_count ?? state.activeBatch?.images?.length ?? 0;
-  state.activeBatch = await api(`/api/batches/${batchId}`);
+  const loadedBatch = await api(`/api/batches/${batchId}`);
+  if (requestId !== state.openBatchRequestId) return false;
+  state.activeBatch = loadedBatch;
   const images = state.activeBatch.images || [];
   const latest = [...images].reverse().find((image) => !image.excluded) || images[images.length - 1] || null;
   const currentImageCount = state.activeBatch?.summary?.image_count ?? images.length;
@@ -164,6 +170,7 @@ async function openBatch(batchId, imageId = null, options = {}) {
     state.imageMode = "auto";
   }
   renderAll();
+  return true;
 }
 
 async function waitForImageResult(batchId, imageId, timeoutMs = 12000) {
@@ -259,6 +266,8 @@ function renderImages() {
       </span>
     `;
     button.addEventListener("click", () => {
+      // A direct user selection takes priority over any older polling response.
+      state.openBatchRequestId += 1;
       state.followLatest = false;
       state.activeImage = image;
       state.points = [];
