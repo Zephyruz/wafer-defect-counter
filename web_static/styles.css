@@ -109,6 +109,14 @@ h2 { margin: 0; font-size: 17px; }
 .field { display: grid; gap: 6px; margin: 14px 0; }
 .field input { height: 40px; padding: 0 10px; border: 1px solid var(--line); border-radius: 6px; }
 
+.referenceManager {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
 .dropzone {
   display: grid;
   place-items: center;
@@ -188,6 +196,24 @@ h2 { margin: 0; font-size: 17px; }
 .summaryStrip strong,
 .liveStrip strong { font-size: 21px; }
 .liveStrip strong { font-size: 20px; }
+
+.ngBanner {
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 132px;
+  padding: 12px 8px;
+  text-align: center;
+  border: 2px solid #d73737;
+  border-radius: 10px;
+  background: #fff5f5;
+  color: #7f1717;
+}
+
+.ngBanner.hiddenPanel { display: none; }
+.ngBanner span { font-size: 20px; font-weight: 700; }
+.ngBanner strong { font-size: 64px; line-height: 1; color: #c51f1f; }
 
 .contentGrid {
   display: grid;

@@ -8,6 +8,7 @@ This repository is intended to stay private because the project may involve comp
 
 - Python + OpenCV wafer image analysis
 - Local web UI for batch management
+- Automatic wafer grid localization (no manual 4-point click needed; manual 4-point fallback retained)
 - Four-point chip calibration and grid preview
 - Automatic OK/NG counting and defect-rate summary
 - Per-image annotated outputs and per-chip CSV reports

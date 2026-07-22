@@ -103,6 +103,93 @@ def write_batch(batch: dict) -> None:
     temp.replace(path)
 
 
+def calibration_references(batch: dict) -> list[dict]:
+    """Return manual references in first, newest, then remaining newest-first order."""
+    references = list(batch.get("calibration_references") or [])
+    if not references and batch.get("references_invalidated_at"):
+        return []
+    if not references:
+        manual_images = [
+            image
+            for image in batch.get("images", [])
+            if image.get("registered") is False
+            and image.get("points")
+            and image.get("status") == "done"
+        ]
+        manual_images.sort(key=lambda image: int(image.get("created_at") or 0))
+        references = [
+            {
+                "image_id": image["id"],
+                "filename": image.get("filename"),
+                "points": image["points"],
+                "created_at": image.get("finished_at") or image.get("created_at") or 0,
+            }
+            for image in manual_images
+        ]
+    if not references and batch.get("calibration_image_id") and batch.get("calibration_points"):
+        references = [{
+            "image_id": batch["calibration_image_id"],
+            "points": batch["calibration_points"],
+            "created_at": batch.get("created_at", 0),
+        }]
+    if batch.get("calibration_reference_order") == "priority":
+        return references
+    if len(references) <= 1:
+        return references
+    first = references[0]
+    newest = references[-1]
+    middle = list(reversed(references[1:-1]))
+    return [first, newest, *middle]
+
+
+def add_calibration_reference(batch: dict, image_id: str, points: list[list[float]]) -> None:
+    references = list(batch.get("calibration_references") or calibration_references(batch))
+    image = next((item for item in batch.get("images", []) if item.get("id") == image_id), {})
+    replacement = {
+        "image_id": image_id,
+        "filename": image.get("filename"),
+        "points": points,
+        "created_at": now_ms(),
+    }
+    if batch.get("calibration_reference_order") == "priority":
+        if references and references[0].get("image_id") == image_id:
+            references[0] = replacement
+        else:
+            references = [item for item in references if item.get("image_id") != image_id]
+            references.insert(1 if references else 0, replacement)
+        batch["calibration_references"] = references
+        return
+    for index, item in enumerate(references):
+        if item.get("image_id") == image_id:
+            references[index] = replacement
+            break
+    else:
+        references.append(replacement)
+    batch["calibration_references"] = references
+    if not batch.get("calibration_image_id"):
+        batch["calibration_image_id"] = image_id
+        batch["calibration_points"] = points
+
+
+def inherited_calibration_references(source: dict) -> list[dict]:
+    images = {image["id"]: image for image in source.get("images", [])}
+    inherited = []
+    for reference in calibration_references(source):
+        source_image = images.get(reference.get("image_id"))
+        image_path = reference.get("image_path") or (source_image or {}).get("path")
+        if not image_path or not Path(image_path).exists():
+            continue
+        inherited.append({
+            "image_id": reference["image_id"],
+            "filename": reference.get("filename") or (source_image or {}).get("filename"),
+            "image_path": image_path,
+            "points": reference["points"],
+            "created_at": reference.get("created_at", 0),
+            "source_batch_id": source["id"],
+        })
+    return inherited
+
+
 def list_batches() -> list[dict]:
     batches = []
     for path in BATCHES_DIR.glob("*/batch.json"):
@@ -149,7 +236,8 @@ def batch_summary(batch: dict) -> dict:
         "good_chips": good_chips,
         "defective_chips": defective_chips,
         "defect_rate": defective_chips / total_chips if total_chips else 0,
-        "has_calibration": False,
+        "has_calibration": bool(calibration_references(batch)),
+        "camera_refocus_token": batch.get("camera_refocus_token"),
         "stopped": bool(batch.get("stopped")),
     }
 
@@ -278,12 +366,22 @@ def add_uploaded_file(batch: dict, file_item) -> dict | None:
     return image
 
 
-def queue_images(batch_id: str, image_ids: list[str], points: list[list[float]]) -> None:
+def queue_images(
+    batch_id: str,
+    image_ids: list[str],
+    points: list[list[float]] | None,
+    references: list[dict] | None = None,
+) -> None:
     for image_id in image_ids:
-        executor.submit(process_image, batch_id, image_id, points)
+        executor.submit(process_image, batch_id, image_id, points, references)
 
 
-def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> None:
+def process_image(
+    batch_id: str,
+    image_id: str,
+    points: list[list[float]] | None,
+    references: list[dict] | None = None,
+) -> None:
     with store_lock:
         batch = read_batch(batch_id)
         image = next(item for item in batch["images"] if item["id"] == image_id)
@@ -292,19 +390,62 @@ def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> No
         image["status"] = "processing"
         image["started_at"] = now_ms()
         image["points"] = points
+        image["auto"] = False
+        image["registered"] = bool(references)
         image["error"] = None
         image["manual_ng_delta"] = 0
         image.pop("corrected_at", None)
         write_batch(batch)
 
     try:
-        from wafer_defect_counter import process_image_file
+        from wafer_defect_counter import (
+            RegistrationFailed,
+            load_image,
+            process_image_file,
+            register_fixture_points,
+        )
+
+        effective_points = points
+        registration = None
+        if references:
+            with store_lock:
+                current_batch = read_batch(batch_id)
+            target_image = load_image(Path(image["path"]))
+            last_registration_error = None
+            for candidate in references:
+                try:
+                    reference = next(
+                        (item for item in current_batch["images"] if item["id"] == candidate["image_id"]),
+                        None,
+                    )
+                    reference_path = candidate.get("image_path") or (reference or {}).get("path")
+                    if not reference_path:
+                        raise StopIteration
+                    reference_image = load_image(Path(reference_path))
+                    effective_points_array, registration = register_fixture_points(
+                        reference_image,
+                        target_image,
+                        candidate["points"],
+                    )
+                    effective_points = effective_points_array.tolist()
+                    registration["reference_image_id"] = candidate["image_id"]
+                    break
+                except (RegistrationFailed, StopIteration) as exc:
+                    last_registration_error = exc
+            else:
+                if isinstance(last_registration_error, RegistrationFailed):
+                    raise last_registration_error
+                raise RegistrationFailed("没有可用的人工校准参考，请人工重新选四点。")
 
         output_dir = batch_dir(batch_id) / "results" / image_id
-        summary = process_image_file(Path(image["path"]), points, output_dir)
+        summary = process_image_file(Path(image["path"]), effective_points, output_dir)
         summary_dict = compact_summary(asdict(summary))
         status = "done"
         error = None
+    except RegistrationFailed as exc:
+        summary_dict = None
+        status = "waiting_points"
+        error = str(exc)
     except Exception as exc:
         summary_dict = None
         status = "failed"
@@ -318,6 +459,9 @@ def process_image(batch_id: str, image_id: str, points: list[list[float]]) -> No
         image["status"] = status
         image["summary"] = summary_dict
         image["error"] = error
+        if status == "done":
+            image["points"] = effective_points
+            image["registration"] = registration
         image["finished_at"] = now_ms()
         write_batch(batch)
 
@@ -332,6 +476,8 @@ class AppHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.send_security_headers()
         self.end_headers()
@@ -363,9 +509,10 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/version":
             self.send_json({
-                "version": "0.7",
+                "version": "0.8",
                 "grid_preview": True,
                 "manual_points_per_image": True,
+                "auto_geometry": True,
                 "review_image_without_indices": True,
                 "manual_ng_correction": True,
             })
@@ -393,11 +540,20 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(parts) >= 4 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "stop":
             self.stop_batch(parts[2])
             return
+        if len(parts) == 5 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "references" and parts[4] == "invalidate-all":
+            self.invalidate_all_references(parts[2])
+            return
+        if len(parts) == 5 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "camera" and parts[4] == "refocus":
+            self.request_camera_refocus(parts[2])
+            return
         if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "exclude":
             self.exclude_image(parts[2], parts[4])
             return
         if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "preview":
             self.preview_grid(parts[2], parts[4])
+            return
+        if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "auto-preview":
+            self.auto_preview_grid(parts[2], parts[4])
             return
         if len(parts) >= 6 and parts[0] == "api" and parts[1] == "batches" and parts[3] == "images" and parts[5] == "correction":
             self.correct_image(parts[2], parts[4])
@@ -457,13 +613,29 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         name = form.getfirst("name") or time.strftime("批次_%Y%m%d_%H%M%S")
         allow_empty = form.getfirst("allow_empty") == "1"
+        reuse_from_batch_id = form.getfirst("reuse_from_batch_id")
         files = form.files
+
+        inherited_references: list[dict] = []
+        if reuse_from_batch_id:
+            try:
+                inherited_references = inherited_calibration_references(read_batch(reuse_from_batch_id))
+            except FileNotFoundError:
+                self.send_error_json("要复用的上一批次不存在", HTTPStatus.NOT_FOUND)
+                return
+            if not inherited_references:
+                self.send_error_json("上一批次没有可复用的人工网格参考")
+                return
 
         batch = {
             "id": uuid.uuid4().hex[:12],
             "name": name,
             "created_at": now_ms(),
-            "calibration_points": None,
+            "calibration_points": inherited_references[0]["points"] if inherited_references else None,
+            "calibration_image_id": inherited_references[0]["image_id"] if inherited_references else None,
+            "calibration_references": inherited_references,
+            "calibration_reference_order": "priority" if inherited_references else "chronological",
+            "inherited_from_batch_id": reuse_from_batch_id if inherited_references else None,
             "stopped": False,
             "images": [],
         }
@@ -477,6 +649,13 @@ class AppHandler(BaseHTTPRequestHandler):
         with store_lock:
             stop_open_batches()
             write_batch(batch)
+        if inherited_references and batch["images"]:
+            queue_images(
+                batch["id"],
+                [image["id"] for image in batch["images"]],
+                None,
+                calibration_references(batch),
+            )
         self.send_json({"batch": batch_summary(batch), "id": batch["id"]}, HTTPStatus.CREATED)
 
     def add_images(self, batch_id: str) -> None:
@@ -508,6 +687,14 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         with store_lock:
             write_batch(batch)
+        references = calibration_references(batch)
+        if references:
+            queue_images(
+                batch_id,
+                added,
+                None,
+                references,
+            )
         self.send_json({"added": len(added), "image_ids": added}, HTTPStatus.CREATED)
 
     def stop_batch(self, batch_id: str) -> None:
@@ -520,11 +707,46 @@ class AppHandler(BaseHTTPRequestHandler):
             stop_open_batches()
         self.send_json({"ok": True, "summary": batch_summary(batch)})
 
+    def invalidate_all_references(self, batch_id: str) -> None:
+        try:
+            batch = read_batch(batch_id)
+        except FileNotFoundError:
+            self.send_error_json("批次不存在", HTTPStatus.NOT_FOUND)
+            return
+        batch["calibration_references"] = []
+        batch["calibration_reference_order"] = "priority"
+        batch["calibration_image_id"] = None
+        batch["calibration_points"] = None
+        batch["references_invalidated_at"] = now_ms()
+        with store_lock:
+            write_batch(batch)
+        self.send_json({
+            "ok": True,
+            "remaining": 0,
+            "summary": batch_summary(batch),
+        })
+
+    def request_camera_refocus(self, batch_id: str) -> None:
+        try:
+            batch = read_batch(batch_id)
+        except FileNotFoundError:
+            self.send_error_json("批次不存在", HTTPStatus.NOT_FOUND)
+            return
+        if batch.get("stopped"):
+            self.send_error_json("当前批次已经停止")
+            return
+        batch["camera_refocus_token"] = uuid.uuid4().hex
+        batch["camera_refocus_requested_at"] = now_ms()
+        with store_lock:
+            write_batch(batch)
+        self.send_json({"ok": True, "token": batch["camera_refocus_token"]})
+
     def submit_points(self, batch_id: str) -> None:
         try:
             payload = self.read_json_body()
-            points = payload["points"]
-            mode = payload.get("mode", "one")
+            points = payload.get("points")
+            if points is not None:
+                points = [[float(p[0]), float(p[1])] for p in points]
             image_id = payload.get("image_id")
             batch = read_batch(batch_id)
         except UploadLimitError as exc:
@@ -537,14 +759,36 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error_json("提交内容不完整")
             return
 
+        if points is None or len(points) != 4:
+            self.send_error_json("需要按顺序提交四个参考芯片中心点")
+            return
+
         if image_id:
             targets = [image_id]
         else:
             self.send_error_json("缺少图片")
             return
 
+        queued_followups: list[str] = []
+        with store_lock:
+            batch = read_batch(batch_id)
+            was_uncalibrated = not calibration_references(batch)
+            add_calibration_reference(batch, image_id, points)
+            if was_uncalibrated:
+                queued_followups = [
+                    item["id"]
+                    for item in batch["images"]
+                    if item["id"] != image_id
+                    and item.get("status") == "waiting_points"
+                    and not item.get("excluded")
+                ]
+            references = calibration_references(batch)
+            write_batch(batch)
+
         queue_images(batch_id, targets, points)
-        self.send_json({"queued": len(targets)})
+        if queued_followups:
+            queue_images(batch_id, queued_followups, None, references)
+        self.send_json({"queued": len(targets) + len(queued_followups)})
 
     def exclude_image(self, batch_id: str, image_id: str) -> None:
         try:
@@ -631,6 +875,30 @@ class AppHandler(BaseHTTPRequestHandler):
         with store_lock:
             write_batch(batch)
         self.send_json({"preview_url": media_url(preview_path)})
+
+    def auto_preview_grid(self, batch_id: str, image_id: str) -> None:
+        try:
+            batch = read_batch(batch_id)
+            image = next(item for item in batch["images"] if item["id"] == image_id)
+        except (FileNotFoundError, StopIteration):
+            self.send_error_json("图片不存在", HTTPStatus.NOT_FOUND)
+            return
+
+        try:
+            from wafer_defect_counter import generate_grid_preview_auto
+
+            output_dir = batch_dir(batch_id) / "previews" / image_id
+            preview_path = generate_grid_preview_auto(Path(image["path"]), output_dir)
+        except Exception as exc:
+            self.send_error_json(str(exc))
+            return
+
+        image["preview_image"] = preview_path
+        image["preview_points"] = None
+        image["auto"] = True
+        with store_lock:
+            write_batch(batch)
+        self.send_json({"preview_url": media_url(preview_path), "auto": True})
 
     def serve_file(self, path: Path) -> None:
         try:
