@@ -7,11 +7,15 @@ const state = {
   followLatest: true,
   previewReady: false,
   previewUrl: "",
+  previewAuto: false,
+  manualMode: false,
+  autoRequested: false,
   imageMode: "auto",
   correctionEditing: false,
   correctionImageId: null,
   repointingImageId: null,
   repointingAt: 0,
+  openBatchRequestId: 0,
   view: {
     zoom: 1,
     panX: 0,
@@ -27,6 +31,7 @@ const els = {
   fileCount: document.querySelector("#fileCount"),
   startBatchBtn: document.querySelector("#startBatchBtn"),
   stopBatchBtn: document.querySelector("#stopBatchBtn"),
+  remoteRefocusBtn: document.querySelector("#remoteRefocusBtn"),
   cameraInput: document.querySelector("#cameraInput"),
   appendInput: document.querySelector("#appendInput"),
   batchList: document.querySelector("#batchList"),
@@ -37,6 +42,7 @@ const els = {
   imageStage: document.querySelector("#imageStage"),
   pointStatus: document.querySelector("#pointStatus"),
   resetPoints: document.querySelector("#resetPoints"),
+  manualCalibrate: document.querySelector("#manualCalibrate"),
   excludeCurrent: document.querySelector("#excludeCurrent"),
   submitPoints: document.querySelector("#submitPoints"),
   zoomOut: document.querySelector("#zoomOut"),
@@ -63,8 +69,12 @@ const els = {
   sumRate: document.querySelector("#sumRate"),
   currentOk: document.querySelector("#currentOk"),
   currentNg: document.querySelector("#currentNg"),
+  ngBanner: document.querySelector("#ngBanner"),
+  ngBannerValue: document.querySelector("#ngBannerValue"),
   currentStatus: document.querySelector("#currentStatus"),
   calibrationStatus: document.querySelector("#calibrationStatus"),
+  referenceManager: document.querySelector("#referenceManager"),
+  clearReferences: document.querySelector("#clearReferences"),
 };
 
 function formatRate(rate) {
@@ -76,10 +86,32 @@ function clampCorrection(value) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
+  const response = await fetch(path, { cache: "no-store", ...options });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "请求失败");
   return payload;
+}
+
+function clearActiveBatchState() {
+  // Any batch request that started before this reset must not restore stale UI state.
+  state.openBatchRequestId += 1;
+  state.activeBatch = null;
+  state.activeImage = null;
+  state.points = [];
+  state.previewReady = false;
+  state.previewUrl = "";
+  state.previewAuto = false;
+  state.manualMode = false;
+  state.autoRequested = false;
+  state.imageMode = "auto";
+  state.followLatest = true;
+  state.correctionEditing = false;
+  state.correctionImageId = null;
+  state.repointingImageId = null;
+  state.repointingAt = 0;
+  state.drag = null;
+  state.view = { zoom: 1, panX: 0, panY: 0 };
+  els.mainImage.removeAttribute("src");
 }
 
 async function loadBatches() {
@@ -87,12 +119,7 @@ async function loadBatches() {
   state.batches = payload.batches;
   renderBatches();
   if (state.activeBatch && state.batches.some((batch) => batch.id === state.activeBatch.id && batch.stopped)) {
-    state.activeBatch = null;
-    state.activeImage = null;
-    state.points = [];
-    state.previewReady = false;
-    state.previewUrl = "";
-    state.imageMode = "auto";
+    clearActiveBatchState();
   }
   if (!state.activeBatch) {
     const current = state.batches.find((batch) => !batch.stopped);
@@ -112,9 +139,12 @@ async function loadBatches() {
 }
 
 async function openBatch(batchId, imageId = null, options = {}) {
+  const requestId = ++state.openBatchRequestId;
   const previousImageId = state.activeImage?.id;
   const previousImageCount = state.activeBatch?.summary?.image_count ?? state.activeBatch?.images?.length ?? 0;
-  state.activeBatch = await api(`/api/batches/${batchId}`);
+  const loadedBatch = await api(`/api/batches/${batchId}`);
+  if (requestId !== state.openBatchRequestId) return false;
+  state.activeBatch = loadedBatch;
   const images = state.activeBatch.images || [];
   const latest = [...images].reverse().find((image) => !image.excluded) || images[images.length - 1] || null;
   const currentImageCount = state.activeBatch?.summary?.image_count ?? images.length;
@@ -134,9 +164,13 @@ async function openBatch(batchId, imageId = null, options = {}) {
     state.points = [];
     state.previewReady = false;
     state.previewUrl = "";
+    state.previewAuto = false;
+    state.manualMode = false;
+    state.autoRequested = false;
     state.imageMode = "auto";
   }
   renderAll();
+  return true;
 }
 
 async function waitForImageResult(batchId, imageId, timeoutMs = 12000) {
@@ -157,6 +191,7 @@ async function waitForImageResult(batchId, imageId, timeoutMs = 12000) {
 function renderAll() {
   renderBatches();
   renderSummary();
+  renderReferenceManager();
   renderImages();
   renderActiveImage();
   renderResults();
@@ -195,7 +230,8 @@ function renderSummary() {
   els.sumGood.textContent = summary.good_chips || 0;
   els.sumBad.textContent = summary.defective_chips || 0;
   els.sumRate.textContent = formatRate(summary.defect_rate);
-  els.calibrationStatus.textContent = state.activeBatch ? "每张手动" : "未开始";
+  els.calibrationStatus.textContent = state.activeBatch ? "自动定位" : "未开始";
+  els.remoteRefocusBtn.disabled = !state.activeBatch || Boolean(state.activeBatch.summary?.stopped);
 }
 
 function statusText(status) {
@@ -230,11 +266,16 @@ function renderImages() {
       </span>
     `;
     button.addEventListener("click", () => {
+      // A direct user selection takes priority over any older polling response.
+      state.openBatchRequestId += 1;
       state.followLatest = false;
       state.activeImage = image;
       state.points = [];
       state.previewReady = false;
       state.previewUrl = "";
+      state.previewAuto = false;
+      state.manualMode = false;
+      state.autoRequested = false;
       state.imageMode = "auto";
       clearCorrectionEditing(image.id);
       renderActiveImage();
@@ -266,8 +307,16 @@ function renderActiveImage() {
     resetView();
   }
   els.pointStatus.textContent = `${state.points.length}/4`;
+  els.submitPoints.textContent = submitPointsLabel();
   applyView();
   drawPoints();
+  maybeRequestAutoPreview();
+}
+
+function submitPointsLabel() {
+  if (state.activeImage?.summary) return "确认网格并统计";
+  if (state.previewReady) return "确认网格并统计";
+  return state.manualMode ? "预览网格" : "等待首张校准";
 }
 
 function clampZoom(value) {
@@ -298,6 +347,7 @@ function zoomBy(factor) {
 
 function canAddPoint() {
   if (!state.activeImage || !els.mainImage.naturalWidth) return false;
+  if (!state.manualMode) return false;
   if (state.points.length >= 4) return false;
   if (state.previewUrl) return false;
   if (state.activeImage.summary && state.imageMode !== "original") return false;
@@ -310,8 +360,9 @@ function undoLastPoint() {
   state.points.pop();
   state.previewReady = false;
   state.previewUrl = "";
+  state.previewAuto = false;
   state.imageMode = "original";
-  els.submitPoints.textContent = "预览网格";
+  els.submitPoints.textContent = submitPointsLabel();
   renderActiveImage();
   renderResults();
 }
@@ -323,6 +374,7 @@ function clearCorrectionEditing(imageId = null) {
 
 function renderResults() {
   const image = state.activeImage;
+  setNgBanner();
   if (!image) {
     els.currentOk.textContent = "0";
     els.currentNg.textContent = "0";
@@ -372,6 +424,7 @@ function renderResults() {
   const editingThisImage = state.correctionEditing && state.correctionImageId === image.id;
   els.currentOk.textContent = ok;
   els.currentNg.textContent = image.summary.defective_chips;
+  setNgBanner(image.summary.defective_chips);
   els.correctionPanel.classList.remove("hiddenPanel");
   if (!editingThisImage) {
     els.ngCorrection.value = delta;
@@ -395,17 +448,44 @@ async function requestGridPreview() {
     });
     state.previewReady = true;
     state.previewUrl = payload.preview_url;
+    state.previewAuto = false;
     els.submitPoints.textContent = "确认网格并统计";
     renderActiveImage();
     renderResults();
   } catch (error) {
     state.previewReady = false;
     state.previewUrl = "";
-    els.submitPoints.textContent = "预览网格";
+    els.submitPoints.textContent = submitPointsLabel();
     alert(error.message);
   } finally {
     els.submitPoints.disabled = false;
   }
+}
+
+async function maybeRequestAutoPreview() {
+  const image = state.activeImage;
+  if (!image || !state.activeBatch) return;
+  if (state.manualMode || image.summary || image.status !== "waiting_points") return;
+  if (state.activeBatch.summary?.has_calibration) {
+    els.pointStatus.textContent = "正在使用首张校准自动对齐";
+    return;
+  }
+  if (image.status !== "waiting_points") return;
+  if (!els.mainImage.naturalWidth) return;
+  enterManualCalibration();
+  els.pointStatus.textContent = "首张照片：请按上、右、下、左选四个芯片中心";
+}
+
+function setNgBanner(value = null) {
+  const visible = value !== null && value !== undefined;
+  els.ngBanner.classList.toggle("hiddenPanel", !visible);
+  els.ngBannerValue.textContent = visible ? String(value) : "0";
+}
+
+function renderReferenceManager() {
+  const hasReferences = Boolean(state.activeBatch?.summary?.has_calibration);
+  els.referenceManager.classList.toggle("hiddenPanel", !hasReferences);
+  els.clearReferences.disabled = !hasReferences;
 }
 
 function imageDrawRect() {
@@ -478,11 +558,36 @@ function canvasPointToImage(event) {
   ];
 }
 
+const reuseReferenceKey = "waferCounterReuseReferenceBatch";
+
+function selectedReferenceBatchId() {
+  const pending = localStorage.getItem(reuseReferenceKey);
+  if (pending) {
+    const reuse = confirm("是否续用上一批的网格点位参考？\n选择“取消”将从新位置重新选四点。");
+    if (!reuse) localStorage.removeItem(reuseReferenceKey);
+    return reuse ? pending : "";
+  }
+  if (state.activeBatch?.summary?.has_calibration) {
+    return confirm("是否续用当前批次的网格点位参考？\n选择“取消”将从新位置重新选四点。")
+      ? state.activeBatch.id
+      : "";
+  }
+  return "";
+}
+
+function attachReferenceReuse(form) {
+  const batchId = selectedReferenceBatchId();
+  if (batchId) form.set("reuse_from_batch_id", batchId);
+  return batchId;
+}
+
 async function createBatchWithFiles(files, name = "") {
   const form = new FormData();
   form.set("name", name || els.batchName.value.trim());
+  const reusedBatchId = attachReferenceReuse(form);
   for (const file of files) form.append("files", file);
   const payload = await api("/api/batches", { method: "POST", body: form });
+  if (reusedBatchId) localStorage.removeItem(reuseReferenceKey);
   state.followLatest = true;
   state.points = [];
   state.previewReady = false;
@@ -496,7 +601,9 @@ async function createEmptyBatch(name = "") {
   const form = new FormData();
   form.set("name", name || els.batchName.value.trim() || `生产_${new Date().toLocaleString()}`);
   form.set("allow_empty", "1");
+  const reusedBatchId = attachReferenceReuse(form);
   const payload = await api("/api/batches", { method: "POST", body: form });
+  if (reusedBatchId) localStorage.removeItem(reuseReferenceKey);
   state.followLatest = true;
   state.points = [];
   state.previewReady = false;
@@ -558,18 +665,56 @@ els.stopBatchBtn.addEventListener("click", async () => {
     alert("还没有当前批次");
     return;
   }
-  if (!confirm("停止并清除当前数据？")) return;
+  if (!confirm("停止当前批次？批次记录和结果仍会保留。")) return;
+  const stoppedBatchId = state.activeBatch.id;
+  const hasReferences = Boolean(state.activeBatch.summary?.has_calibration);
   try {
     await api(`/api/batches/${state.activeBatch.id}/stop`, { method: "POST" });
-    state.activeBatch = null;
-    state.activeImage = null;
-    state.points = [];
-    state.previewReady = false;
-    state.previewUrl = "";
-    state.imageMode = "auto";
-    state.followLatest = true;
+    if (hasReferences) {
+      localStorage.setItem(reuseReferenceKey, stoppedBatchId);
+    } else {
+      localStorage.removeItem(reuseReferenceKey);
+    }
+    clearActiveBatchState();
+    renderAll();
     await loadBatches();
     renderAll();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+els.remoteRefocusBtn.addEventListener("click", async () => {
+  if (!state.activeBatch) {
+    alert("请先开始批次");
+    return;
+  }
+  els.remoteRefocusBtn.disabled = true;
+  els.remoteRefocusBtn.textContent = "正在通知手机...";
+  try {
+    await api(`/api/batches/${state.activeBatch.id}/camera/refocus`, { method: "POST" });
+    els.currentStatus.textContent = "已通知手机重新对焦";
+    els.remoteRefocusBtn.textContent = "已发送重新对焦";
+    setTimeout(() => {
+      els.remoteRefocusBtn.textContent = "让手机重新对焦";
+      els.remoteRefocusBtn.disabled = !state.activeBatch;
+    }, 1500);
+  } catch (error) {
+    els.remoteRefocusBtn.textContent = "让手机重新对焦";
+    els.remoteRefocusBtn.disabled = false;
+    alert(error.message);
+  }
+});
+
+els.clearReferences.addEventListener("click", async () => {
+  if (!state.activeBatch) return;
+  if (!confirm("确定位置已经变化并重新校准吗？\n现有网格参考将全部作废，下一张照片需要重新选四点。")) return;
+  try {
+    await api(`/api/batches/${state.activeBatch.id}/references/invalidate-all`, {
+      method: "POST",
+    });
+    await openBatch(state.activeBatch.id, state.activeImage?.id, { preservePoints: true, followLatest: false });
+    await loadBatches();
   } catch (error) {
     alert(error.message);
   }
@@ -658,13 +803,15 @@ async function resetCurrentPoints() {
   state.points = [];
   state.previewReady = false;
   state.previewUrl = "";
+  state.previewAuto = false;
+  state.autoRequested = false;
   state.imageMode = "original";
   clearCorrectionEditing();
   state.repointingImageId = state.activeImage?.id || null;
   state.repointingAt = Date.now();
   els.ngCorrection.value = 0;
   els.correctionStatus.textContent = "";
-  els.submitPoints.textContent = "预览网格";
+  els.submitPoints.textContent = submitPointsLabel();
   renderActiveImage();
   drawPoints();
   renderResults();
@@ -690,13 +837,33 @@ els.resetPoints.addEventListener("click", () => {
   resetCurrentPoints();
 });
 
+function enterManualCalibration() {
+  if (!state.activeBatch || !state.activeImage) return;
+  state.followLatest = false;
+  state.manualMode = true;
+  state.previewReady = false;
+  state.previewUrl = "";
+  state.previewAuto = false;
+  state.points = [];
+  state.imageMode = "original";
+  els.submitPoints.textContent = submitPointsLabel();
+  els.pointStatus.textContent = "0/4 手动模式";
+  renderActiveImage();
+  drawPoints();
+  renderResults();
+}
+
+els.manualCalibrate.addEventListener("click", () => {
+  enterManualCalibration();
+});
+
 els.submitPoints.addEventListener("click", async () => {
   if (!state.activeBatch || !state.activeImage) {
     alert("请先选择图片");
     return;
   }
   if (state.points.length !== 4) {
-    alert("需要按顺序点满四个点");
+    alert("需要按上、右、下、左的顺序点满四个芯片中心");
     return;
   }
   if (!state.previewReady) {
@@ -708,15 +875,17 @@ els.submitPoints.addEventListener("click", async () => {
   try {
     const batchId = state.activeBatch.id;
     const imageId = state.activeImage.id;
+    const body = { image_id: imageId, points: state.points, mode: "one" };
     await api(`/api/batches/${batchId}/points`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image_id: imageId, points: state.points, mode: "one" }),
+      body: JSON.stringify(body),
     });
     state.followLatest = false;
     clearCorrectionEditing(imageId);
     state.previewReady = false;
     state.previewUrl = "";
+    state.previewAuto = false;
     state.imageMode = "result";
     await waitForImageResult(batchId, imageId);
     await loadBatches();
@@ -724,7 +893,7 @@ els.submitPoints.addEventListener("click", async () => {
     alert(error.message);
   } finally {
     els.submitPoints.disabled = false;
-    els.submitPoints.textContent = state.activeImage?.summary ? "确认网格并统计" : "预览网格";
+    els.submitPoints.textContent = submitPointsLabel();
   }
 });
 
@@ -831,8 +1000,14 @@ els.showResult.addEventListener("click", () => {
 });
 els.refreshBtn.addEventListener("click", loadBatches);
 els.mainImage.addEventListener("load", () => {
+  if (state.activeImage?.summary && !state.previewUrl && state.imageMode !== "original") {
+    state.view.zoom = 1.60;
+    state.view.panX = 0;
+    state.view.panY = 0;
+  }
   applyView();
   drawPoints();
+  maybeRequestAutoPreview();
 });
 window.addEventListener("resize", drawPoints);
 window.addEventListener("keydown", (event) => {

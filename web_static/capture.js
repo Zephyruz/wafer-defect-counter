@@ -16,7 +16,7 @@ const els = {
 };
 
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
+  const response = await fetch(path, { cache: "no-store", ...options });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "请求失败");
   return payload;

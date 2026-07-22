@@ -40,6 +40,23 @@ TOTAL_EXPECTED_CHIPS = sum(ROW_COUNTS)
 REFERENCE_POINT_NAMES = ["上方中间芯片中心", "右侧中间芯片中心", "下方中间芯片中心", "左侧中间芯片中心"]
 
 
+class AutoDetectFailed(RuntimeError):
+    """Raised when automatic wafer geometry detection cannot locate the grid with enough confidence."""
+
+
+class RegistrationFailed(RuntimeError):
+    """Raised when a fixture image cannot be aligned safely to its calibration image."""
+
+
+def _with_grid_refine_enabled(cfg: Config) -> Config:
+    """Return a copy of cfg with grid refinement turned on for auto calibration."""
+    refined = Config()
+    for field in refined.__dataclass_fields__:
+        setattr(refined, field, getattr(cfg, field))
+    refined.refine_grid = True
+    return refined
+
+
 @dataclass
 class Config:
     """晶圆计数相关阈值和几何参数。"""
@@ -60,6 +77,8 @@ class Config:
     grid_refine_pitch_steps: int = 2
     grid_refine_offset_fraction: float = 0.18
     grid_refine_pitch_fraction: float = 0.018
+    grid_refine_angle_range_deg: float = 0.0
+    grid_refine_angle_steps: int = 0
 
     # Marker detection
     dark_value_max: int = 70
@@ -81,6 +100,27 @@ class Config:
     blue_missing_fraction: float = 0.18
     low_texture_std_max: float = 18.0
     missing_value_min: int = 35
+
+    # Auto geometry detection (replaces manual 4-point calibration)
+    auto_detect_min_score: float = 6.0
+    auto_detect_min_region_score: float = 0.0
+    auto_detect_min_margin: float = 1.0
+    auto_detect_angle_range_deg: float = 15.0
+    auto_detect_angle_step_deg: float = 1.0
+    auto_detect_scale_min: float = 0.78
+    auto_detect_scale_max: float = 1.02
+    auto_detect_scale_steps: int = 13
+    auto_detect_min_radius_fraction: float = 0.25
+    auto_detect_disk_min_area_fraction: float = 0.15
+
+    # Fixed-fixture registration (first image manual, later images aligned to it)
+    registration_width: int = 540
+    registration_height: int = 960
+    registration_min_correlation: float = 0.70
+    registration_max_translation_px: float = 60.0
+    registration_high_confidence: float = 0.85
+    registration_high_confidence_max_translation_px: float = 80.0
+    registration_max_angle_deg: float = 4.0
 
     # Visualization
     normal_color: tuple[int, int, int] = (40, 210, 40)
@@ -158,6 +198,77 @@ def load_image(path: Path) -> np.ndarray:
     if image is None:
         raise FileNotFoundError(f"无法读取图片：{path}")
     return image
+
+
+def register_fixture_points(
+    reference_image: np.ndarray,
+    target_image: np.ndarray,
+    reference_points: list[list[float]] | np.ndarray,
+    cfg: Config | None = None,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Move calibration points from a fixture reference photo onto a later photo."""
+    cfg = cfg or Config()
+    points = np.asarray(reference_points, dtype=np.float32)
+    if points.shape != (4, 2):
+        raise ValueError("reference_points must contain four [x, y] coordinates")
+    if reference_image.shape[:2] != target_image.shape[:2]:
+        raise RegistrationFailed("照片尺寸与首张校准照片不同，请人工重新选四点。")
+
+    size = (cfg.registration_width, cfg.registration_height)
+
+    def registration_view(image: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
+        gray = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        return gray.astype(np.float32) / 255.0
+
+    reference_small = registration_view(reference_image)
+    target_small = registration_view(target_image)
+    warp = np.eye(2, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
+    try:
+        correlation, warp = cv2.findTransformECC(
+            reference_small,
+            target_small,
+            warp,
+            cv2.MOTION_EUCLIDEAN,
+            criteria,
+            None,
+            5,
+        )
+    except cv2.error as exc:
+        raise RegistrationFailed("照片与首张校准图无法稳定对齐，请人工重新选四点。") from exc
+
+    sx = size[0] / reference_image.shape[1]
+    sy = size[1] / reference_image.shape[0]
+    warp_full = warp.copy()
+    warp_full[0, 2] /= sx
+    warp_full[1, 2] /= sy
+    dx = float(warp_full[0, 2])
+    dy = float(warp_full[1, 2])
+    translation = math.hypot(dx, dy)
+    angle = math.degrees(math.atan2(float(warp_full[1, 0]), float(warp_full[0, 0])))
+    if correlation < cfg.registration_min_correlation:
+        raise RegistrationFailed(f"照片对齐置信度不足（{correlation:.3f}），请人工重新选四点。")
+    max_translation = (
+        cfg.registration_high_confidence_max_translation_px
+        if correlation >= cfg.registration_high_confidence
+        else cfg.registration_max_translation_px
+    )
+    if translation > max_translation or abs(angle) > cfg.registration_max_angle_deg:
+        raise RegistrationFailed(
+            f"照片移动超出支架允许范围（位移 {translation:.1f}px，旋转 {angle:.2f}°），请人工重新选四点。"
+        )
+
+    adjusted = cv2.transform(points.reshape(1, -1, 2), warp_full).reshape(-1, 2)
+    metrics = {
+        "correlation": float(correlation),
+        "dx": dx,
+        "dy": dy,
+        "translation": translation,
+        "angle_deg": angle,
+    }
+    return adjusted, metrics
 
 
 def save_image(path: Path, image: np.ndarray) -> None:
@@ -337,6 +448,118 @@ def rotate_points(points: np.ndarray, angle_deg: float) -> np.ndarray:
     return points @ rot.T
 
 
+def _detect_wafer_disk(image: np.ndarray, cfg: Config) -> tuple[tuple[float, float], float, np.ndarray]:
+    """Locate the wafer disk via the surrounding blue tape ring.
+
+    Returns (center_xy, radius, disk_mask). The disk mask covers the chip-filled
+    wafer interior; the blue tape ring is excluded so it does not skew the fit.
+    """
+    features = build_image_features(image, cfg)
+    blue = features.blue
+    image_area = float(image.shape[0] * image.shape[1])
+
+    # Dilate blue tape so the chip-filled interior becomes a solid hole we can fill.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    filled = cv2.morphologyEx(cv2.bitwise_not(blue), cv2.MORPH_CLOSE, kernel)
+    # Flood-fill from the image corners (background) to label outside-tape regions.
+    flood = filled.copy()
+    h, w = filled.shape[:2]
+    mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    for seed in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]:
+        cv2.floodFill(flood, mask, seed, 0)
+    disk_mask = (flood > 0).astype(np.uint8) * 255
+    disk_mask = cv2.morphologyEx(disk_mask, cv2.MORPH_OPEN, kernel)
+
+    disk_area = float(cv2.countNonZero(disk_mask))
+    if disk_area < image_area * cfg.auto_detect_disk_min_area_fraction:
+        # Fallback: largest bright/gray contour when blue tape ring is weak.
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (0, 0), 6)
+        _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        disk_mask = binary
+        disk_area = float(cv2.countNonZero(disk_mask))
+        if disk_area < image_area * cfg.auto_detect_disk_min_area_fraction:
+            raise AutoDetectFailed(f"未找到晶圆圆盘，蓝膜/圆盘面积占比过小（{disk_area / image_area:.2%}）。")
+
+    contours, _ = cv2.findContours(disk_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise AutoDetectFailed("圆盘掩膜没有轮廓。")
+    largest = max(contours, key=cv2.contourArea)
+    (cx, cy), radius = cv2.minEnclosingCircle(largest)
+
+    min_radius = min(image.shape[0], image.shape[1]) * cfg.auto_detect_min_radius_fraction
+    if radius < min_radius:
+        raise AutoDetectFailed(f"圆盘半径过小（{radius:.0f}px < {min_radius:.0f}px）。")
+
+    return (float(cx), float(cy)), float(radius), disk_mask
+
+
+def auto_detect_geometry(image: np.ndarray, cfg: Config) -> tuple[WaferGeometry, float]:
+    """Detect wafer grid geometry (center, angle, pitch) from the image alone.
+
+    Replaces manual 4-point calibration. Returns (geometry, confidence) where
+    confidence is the final grid-alignment score. Raises AutoDetectFailed when
+    the wafer disk or grid cannot be located confidently — callers fall back to
+    manual 4-point input.
+    """
+    (cx, cy), radius, _disk_mask = _detect_wafer_disk(image, cfg)
+
+    rows = len(ROW_COUNTS)
+    max_cols = max(ROW_COUNTS)
+    # Disk diameter spans 23 chips (middle row has 23 cols; 23 rows tall).
+    diameter = radius * 2.0
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    response = cv2.GaussianBlur(255 - gray, (3, 3), 0)
+
+    center = np.array([cx, cy], dtype=np.float32)
+    step = cfg.auto_detect_angle_step_deg
+    span = cfg.auto_detect_angle_range_deg
+    angles = np.arange(-span, span + step * 0.5, step)
+    scales = np.linspace(cfg.auto_detect_scale_min, cfg.auto_detect_scale_max, cfg.auto_detect_scale_steps)
+    candidates: list[tuple[float, WaferGeometry]] = []
+    for scale in scales:
+        size = diameter * float(scale)
+        for angle in angles:
+            candidate = WaferGeometry(
+                center=center,
+                width=size,
+                height=size * rows / max_cols,
+                angle_deg=float(angle),
+            )
+            candidates.append((grid_alignment_score(response, candidate), candidate))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_score, geometry = candidates[0]
+    distinct_scores = [
+        score
+        for score, candidate in candidates[1:]
+        if abs(candidate.angle_deg - geometry.angle_deg) >= max(2.0, step * 2.0)
+    ]
+    runner_up = distinct_scores[0] if distinct_scores else -math.inf
+    margin = best_score - runner_up
+
+    if best_score < cfg.auto_detect_min_score:
+        raise AutoDetectFailed(
+            f"自动网格定位置信度不足（分数 {best_score:.1f} < {cfg.auto_detect_min_score}），请改用手动 4 点校准。"
+        )
+    if abs(geometry.angle_deg) >= span - step * 0.5:
+        raise AutoDetectFailed(f"自动网格角度落在搜索边界（{geometry.angle_deg:.1f}°），请改用手动 4 点校准。")
+    if margin < cfg.auto_detect_min_margin:
+        raise AutoDetectFailed(
+            f"自动网格方向不明确（最优分数仅领先 {margin:.1f} < {cfg.auto_detect_min_margin}），请改用手动 4 点校准。"
+        )
+
+    geometry, refined_score = refine_grid_geometry(image, geometry, _with_grid_refine_enabled(cfg))
+    region_score = grid_alignment_region_score(response, geometry)
+    if region_score < cfg.auto_detect_min_region_score:
+        raise AutoDetectFailed(
+            f"自动网格局部贴合不足（最差区域 {region_score:.1f} < {cfg.auto_detect_min_region_score}），请改用手动 4 点校准。"
+        )
+
+    return geometry, float(refined_score)
+
+
 def generate_chip_cells(geometry: WaferGeometry, cfg: Config) -> list[ChipCell]:
     rows = len(ROW_COUNTS)
     max_cols = max(ROW_COUNTS)
@@ -368,30 +591,106 @@ def generate_chip_cells(geometry: WaferGeometry, cfg: Config) -> list[ChipCell]:
     return cells
 
 
-def grid_alignment_score(response: np.ndarray, geometry: WaferGeometry) -> float:
+def _grid_alignment_scores(response: np.ndarray, geometry: WaferGeometry) -> tuple[float, float]:
+    """Score rotated grid boundaries against neighboring chip interiors.
+
+    Dark separator lines should have a stronger inverted-gray response than
+    samples roughly one third of a pitch inside the adjacent chips.  Sampling
+    is performed in the candidate's rotated coordinate system, so angle,
+    center, and pitch all affect the result.
+    """
     rows = len(ROW_COUNTS)
     max_cols = max(ROW_COUNTS)
     pitch_x = geometry.width / max_cols
     pitch_y = geometry.height / rows
+    samples_per_line = 128
 
-    values: list[float] = []
-    x0 = int(max(0, geometry.center[0] - geometry.width * 0.42))
-    x1 = int(min(response.shape[1] - 1, geometry.center[0] + geometry.width * 0.42))
-    y0 = int(max(0, geometry.center[1] - geometry.height * 0.42))
-    y1 = int(min(response.shape[0] - 1, geometry.center[1] + geometry.height * 0.42))
-    half_band = 2
+    horizontal_x = np.linspace(-geometry.width * 0.40, geometry.width * 0.40, samples_per_line)
+    horizontal_y = (np.arange(1, rows, dtype=np.float32) - rows / 2.0) * pitch_y
+    hx = np.tile(horizontal_x, len(horizontal_y))
+    hy = np.repeat(horizontal_y, samples_per_line)
 
-    for r in range(1, rows):
-        y = int(round(geometry.center[1] + (r - rows / 2.0) * pitch_y))
-        if half_band <= y < response.shape[0] - half_band and x1 > x0:
-            values.append(float(np.mean(response[y - half_band : y + half_band + 1, x0:x1])))
+    vertical_y = np.linspace(-geometry.height * 0.40, geometry.height * 0.40, samples_per_line)
+    vertical_x = (np.arange(1, max_cols, dtype=np.float32) - max_cols / 2.0) * pitch_x
+    vx = np.repeat(vertical_x, samples_per_line)
+    vy = np.tile(vertical_y, len(vertical_x))
 
-    for c in range(1, max_cols):
-        x = int(round(geometry.center[0] + (c - max_cols / 2.0) * pitch_x))
-        if half_band <= x < response.shape[1] - half_band and y1 > y0:
-            values.append(float(np.mean(response[y0:y1, x - half_band : x + half_band + 1])))
+    def sample(local_x: np.ndarray, local_y: np.ndarray) -> np.ndarray:
+        points = np.column_stack([local_x, local_y]).astype(np.float32)
+        rotated = rotate_points(points, geometry.angle_deg)
+        map_x = (rotated[:, 0] + geometry.center[0]).reshape(1, -1).astype(np.float32)
+        map_y = (rotated[:, 1] + geometry.center[1]).reshape(1, -1).astype(np.float32)
+        values = cv2.remap(
+            response,
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ).reshape(-1).astype(np.float32)
+        valid = (
+            (map_x.reshape(-1) >= 1)
+            & (map_x.reshape(-1) < response.shape[1] - 1)
+            & (map_y.reshape(-1) >= 1)
+            & (map_y.reshape(-1) < response.shape[0] - 1)
+        )
+        values[~valid] = np.nan
+        return values
 
-    return float(np.mean(values)) if values else 0.0
+    band = max(1.0, min(pitch_x, pitch_y) * 0.025)
+    interior_x = pitch_x * 0.30
+    interior_y = pitch_y * 0.30
+
+    def mean_available(parts: list[np.ndarray]) -> np.ndarray:
+        stacked = np.stack(parts)
+        counts = np.sum(np.isfinite(stacked), axis=0)
+        return np.divide(
+            np.nansum(stacked, axis=0),
+            counts,
+            out=np.full(counts.shape, np.nan, dtype=np.float32),
+            where=counts > 0,
+        )
+
+    horizontal_boundary = mean_available([sample(hx, hy - band), sample(hx, hy), sample(hx, hy + band)])
+    horizontal_interior = mean_available([sample(hx, hy - interior_y), sample(hx, hy + interior_y)])
+    vertical_boundary = mean_available([sample(vx - band, vy), sample(vx, vy), sample(vx + band, vy)])
+    vertical_interior = mean_available([sample(vx - interior_x, vy), sample(vx + interior_x, vy)])
+    horizontal_contrast = horizontal_boundary - horizontal_interior
+    vertical_contrast = vertical_boundary - vertical_interior
+
+    region_scores: list[float] = []
+    for x_positive in (False, True):
+        for y_positive in (False, True):
+            h_mask = (
+                ((hx >= 0) == x_positive)
+                & ((hy >= 0) == y_positive)
+                & (np.abs(hx) <= geometry.width * 0.28)
+            )
+            v_mask = (
+                ((vx >= 0) == x_positive)
+                & ((vy >= 0) == y_positive)
+                & (np.abs(vy) <= geometry.height * 0.28)
+            )
+            h_region = horizontal_contrast[h_mask]
+            v_region = vertical_contrast[v_mask]
+            region = np.concatenate([h_region, v_region])
+            region = region[np.isfinite(region)]
+            if region.size:
+                region_scores.append(float(np.mean(region)))
+
+    all_contrast = np.concatenate([horizontal_contrast, vertical_contrast])
+    all_contrast = all_contrast[np.isfinite(all_contrast)]
+    if not all_contrast.size or len(region_scores) != 4:
+        return -math.inf, -math.inf
+    return float(np.mean(all_contrast)), float(min(region_scores))
+
+
+def grid_alignment_score(response: np.ndarray, geometry: WaferGeometry) -> float:
+    return _grid_alignment_scores(response, geometry)[0]
+
+
+def grid_alignment_region_score(response: np.ndarray, geometry: WaferGeometry) -> float:
+    return _grid_alignment_scores(response, geometry)[1]
 
 
 def refine_grid_geometry(warped: np.ndarray, geometry: WaferGeometry, cfg: Config) -> tuple[WaferGeometry, float]:
@@ -400,6 +699,27 @@ def refine_grid_geometry(warped: np.ndarray, geometry: WaferGeometry, cfg: Confi
     if not cfg.refine_grid:
         return geometry, grid_alignment_score(response, geometry)
 
+    best_geometry = geometry
+    best_score = grid_alignment_score(response, geometry)
+    if cfg.grid_refine_angle_range_deg > 0 and cfg.grid_refine_angle_steps > 0:
+        angle_values = np.linspace(
+            geometry.angle_deg - cfg.grid_refine_angle_range_deg,
+            geometry.angle_deg + cfg.grid_refine_angle_range_deg,
+            cfg.grid_refine_angle_steps * 2 + 1,
+        )
+        for angle in angle_values:
+            candidate = WaferGeometry(
+                center=geometry.center.copy(),
+                width=geometry.width,
+                height=geometry.height,
+                angle_deg=float(angle),
+            )
+            score = grid_alignment_score(response, candidate)
+            if score > best_score:
+                best_score = score
+                best_geometry = candidate
+
+    geometry = best_geometry
     pitch_x = geometry.width / max(ROW_COUNTS)
     pitch_y = geometry.height / len(ROW_COUNTS)
     offset_x_values = np.linspace(-pitch_x * cfg.grid_refine_offset_fraction, pitch_x * cfg.grid_refine_offset_fraction, cfg.grid_refine_offset_steps)
@@ -407,8 +727,6 @@ def refine_grid_geometry(warped: np.ndarray, geometry: WaferGeometry, cfg: Confi
     pitch_x_scale_values = np.linspace(1.0 - cfg.grid_refine_pitch_fraction, 1.0 + cfg.grid_refine_pitch_fraction, cfg.grid_refine_pitch_steps * 2 + 1)
     pitch_y_scale_values = np.linspace(1.0 - cfg.grid_refine_pitch_fraction, 1.0 + cfg.grid_refine_pitch_fraction, cfg.grid_refine_pitch_steps * 2 + 1)
 
-    best_geometry = geometry
-    best_score = grid_alignment_score(response, geometry)
     for sx in pitch_x_scale_values:
         for sy in pitch_y_scale_values:
             for dx in offset_x_values:
@@ -661,6 +979,29 @@ def analyze_image_manual(
     return results, geometry, debug_masks, warped, inverse
 
 
+def analyze_image_auto(
+    image: np.ndarray,
+    cfg: Config,
+) -> tuple[list[ChipResult], WaferGeometry, dict[str, np.ndarray], np.ndarray, np.ndarray | None]:
+    """Auto-calibration variant of analyze_image_manual.
+
+    Detects wafer geometry from the image alone (no 4-point input). Cells are
+    generated directly in the original image coordinate system, so the inverse
+    transform is None and downstream transform_* helpers pass coordinates through.
+    """
+    geometry, grid_score = auto_detect_geometry(image, cfg)
+    cells = generate_chip_cells(geometry, cfg)
+    features = build_image_features(image, cfg)
+    results = [evaluate_chip(image, cell, cfg, features) for cell in cells]
+    debug_masks = {
+        "warped": image,
+        "manual_points": None,
+        "perspective_matrix": None,
+        "grid_alignment_score": grid_score,
+    }
+    return results, geometry, debug_masks, image, None
+
+
 def draw_label(
     image: np.ndarray,
     text: str,
@@ -835,14 +1176,17 @@ def find_points_file(points_dir: Path, image_path: Path) -> Path:
 
 def process_one_image(
     image_path: Path,
-    points: np.ndarray,
+    points: np.ndarray | None,
     cfg: Config,
     out_path: Path,
     debug_path: Path,
     report_path: Path | None,
 ) -> list[ChipResult]:
     image = load_image(image_path)
-    results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, points, cfg)
+    if points is None:
+        results, geometry, debug_masks, _warped, cell_to_image = analyze_image_auto(image, cfg)
+    else:
+        results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, points, cfg)
     if len(results) != TOTAL_EXPECTED_CHIPS:
         raise RuntimeError(f"内部布局错误：预期 {TOTAL_EXPECTED_CHIPS} 个芯片，实际 {len(results)} 个。")
 
@@ -895,14 +1239,25 @@ def process_batch(args: argparse.Namespace, cfg: Config) -> None:
     for image_path in image_paths:
         points_path = find_points_file(points_dir, image_path)
         print(f"\n处理：{image_path.name}")
-        if points_path.exists():
+        points: np.ndarray | None = None
+        if not args.auto and points_path.exists():
             points = load_points(points_path)
             print(f"已读取点位：{points_path}")
+        elif args.auto:
+            print("使用自动网格定位。")
         else:
-            image = load_image(image_path)
-            points = collect_manual_points(image, cfg)
-            save_points(points_path, points)
-            print(f"已保存点位：{points_path}")
+            # No saved points and not --auto: try auto first, fall back to manual 4-point.
+            try:
+                image = load_image(image_path)
+                _ = auto_detect_geometry(image, cfg)
+                points = None
+                print("自动网格定位可用。")
+            except AutoDetectFailed as exc:
+                print(f"自动定位失败：{exc}；改为人工点击 4 点。")
+                image = load_image(image_path)
+                points = collect_manual_points(image, cfg)
+                save_points(points_path, points)
+                print(f"已保存点位：{points_path}")
 
         stem = image_path.stem
         out_path = output_dir / f"result{stem}.png"
@@ -939,20 +1294,26 @@ def process_batch(args: argparse.Namespace, cfg: Config) -> None:
 
 def process_image_file(
     image_path: Path,
-    points: list[list[float]] | np.ndarray,
+    points: list[list[float]] | np.ndarray | None,
     output_dir: Path,
     cfg: Config | None = None,
 ) -> ImageAnalysisSummary:
-    """Analyze one image from a web/API caller without opening manual UI windows."""
+    """Analyze one image from a web/API caller without opening manual UI windows.
+
+    When points is None, auto-detects wafer geometry from the image; otherwise
+    falls back to manual 4-point calibration.
+    """
     cfg = cfg or Config()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image = load_image(image_path)
-    point_array = np.array(points, dtype=np.float32)
-    if point_array.shape != (4, 2):
-        raise ValueError("points must contain four [x, y] coordinates")
-
-    results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, point_array, cfg)
+    if points is None:
+        results, geometry, debug_masks, _warped, cell_to_image = analyze_image_auto(image, cfg)
+    else:
+        point_array = np.array(points, dtype=np.float32)
+        if point_array.shape != (4, 2):
+            raise ValueError("points must contain four [x, y] coordinates")
+        results, geometry, debug_masks, _warped, cell_to_image = analyze_image_manual(image, point_array, cfg)
     if len(results) != TOTAL_EXPECTED_CHIPS:
         raise RuntimeError(f"Expected {TOTAL_EXPECTED_CHIPS} chips, got {len(results)}")
 
@@ -1020,6 +1381,40 @@ def generate_grid_preview_file(
     return str(preview_path)
 
 
+def generate_grid_preview_auto(
+    image_path: Path,
+    output_dir: Path,
+    cfg: Config | None = None,
+) -> str:
+    """Generate an auto-detected grid preview (no manual 4-point input)."""
+    cfg = cfg or Config()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image = load_image(image_path)
+    geometry, score = auto_detect_geometry(image, cfg)
+
+    cells = generate_chip_cells(geometry, cfg)
+    out = image.copy()
+    rect = (tuple(geometry.center), (geometry.width, geometry.height), geometry.angle_deg)
+    outer = transform_polygon(cv2.boxPoints(rect).astype(np.int32), None)
+    cv2.polylines(out, [outer], True, cfg.grid_color, 3, cv2.LINE_AA)
+    for cell in cells:
+        polygon = transform_polygon(cell_polygon(cell), None)
+        cv2.polylines(out, [polygon], True, cfg.grid_color, 1, cv2.LINE_AA)
+
+    draw_text(
+        out,
+        f"自动网格预览：分数 {score:.1f}，角度 {geometry.angle_deg:.1f} 度；对不准请用手动 4 点",
+        (18, 14),
+        cfg,
+        size=26,
+        color=(255, 220, 100),
+    )
+    preview_path = output_dir / f"{image_path.stem}_grid_preview.jpg"
+    save_image(preview_path, out)
+    return str(preview_path)
+
+
 def apply_detection_preset(cfg: Config, preset: str) -> None:
     """Apply coarse threshold presets before per-parameter CLI overrides."""
     if preset == "sensitive":
@@ -1049,6 +1444,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refine-grid", action="store_true", help="实验功能：自动微调网格中心和间距。默认关闭。")
     parser.add_argument("--no-refine-grid", action="store_true", help="兼容旧参数：保持关闭网格自动微调。")
     parser.add_argument("--points", type=Path, default=None, help="读取已保存的四个参考芯片中心点，跳过人工点击。")
+    parser.add_argument("--auto", action="store_true", help="自动定位网格，不弹窗、不读 4 点；失败时报错退出。")
     parser.add_argument("--save-points", type=Path, default=None, help="保存本次人工点击的四个参考芯片中心点。")
     parser.add_argument(
         "--detection-preset",
@@ -1097,17 +1493,20 @@ def main() -> None:
         raise SystemExit("请提供一张图片，或使用 --batch-dir 指定批量处理文件夹。")
 
     image = load_image(args.image)
-    print("当前模式：人工参考芯片中心校准。")
-    if args.points:
-        points = load_points(args.points)
-        print(f"已读取校准点：{args.points}")
+    if args.auto:
+        print("当前模式：自动网格定位（无需点 4 点）。")
+        results, geometry, debug_masks, warped, cell_to_image = analyze_image_auto(image, cfg)
     else:
-        points = collect_manual_points(image, cfg)
-        if args.save_points:
-            save_points(args.save_points, points)
-            print(f"已保存校准点：{args.save_points}")
-
-    results, geometry, debug_masks, warped, cell_to_image = analyze_image_manual(image, points, cfg)
+        print("当前模式：人工参考芯片中心校准。")
+        if args.points:
+            points = load_points(args.points)
+            print(f"已读取校准点：{args.points}")
+        else:
+            points = collect_manual_points(image, cfg)
+            if args.save_points:
+                save_points(args.save_points, points)
+                print(f"已保存校准点：{args.save_points}")
+        results, geometry, debug_masks, warped, cell_to_image = analyze_image_manual(image, points, cfg)
 
     if len(results) != TOTAL_EXPECTED_CHIPS:
         raise RuntimeError(f"内部布局错误：预期 {TOTAL_EXPECTED_CHIPS} 个芯片，实际 {len(results)} 个。")

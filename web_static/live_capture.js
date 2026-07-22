@@ -33,8 +33,18 @@ const els = {
   statusText: document.querySelector("#statusText"),
 };
 
+async function fetchWithTimeout(path, options = {}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+  try {
+    return await fetch(path, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
+  const response = await fetchWithTimeout(path, { cache: "no-store", ...options });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "请求失败");
   return payload;
@@ -59,6 +69,30 @@ async function loadBatches() {
     if (current) state.activeBatchId = current.id;
   }
   render();
+}
+
+async function handleRemoteRefocus() {
+  const token = activeBatch()?.camera_refocus_token || "";
+  if (!token || token === state.lastRefocusToken || state.isUploading || state.isRefocusing) return;
+  if (!state.stream || !videoReady()) {
+    setStatus("电脑请求重新对焦，请先开启相机");
+    return;
+  }
+  state.isRefocusing = true;
+  state.isUploading = true;
+  render();
+  setStatus("收到电脑指令，正在重新对焦...");
+  try {
+    await refocusCamera();
+    state.lastRefocusToken = token;
+    setStatus("重新对焦完成，可以拍照");
+  } catch (error) {
+    setStatus(`重新对焦失败：${error.message}`);
+  } finally {
+    state.isRefocusing = false;
+    state.isUploading = false;
+    render();
+  }
 }
 
 function render() {
@@ -246,6 +280,18 @@ function setupZoom() {
   applyZoom();
 }
 
+async function setupFocus() {
+  const [track] = state.stream?.getVideoTracks() || [];
+  const capabilities = track?.getCapabilities ? track.getCapabilities() : {};
+  state.focusModes = Array.isArray(capabilities.focusMode) ? capabilities.focusMode : [];
+  if (!track?.applyConstraints || !state.focusModes.includes("continuous")) return;
+  try {
+    await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+  } catch (_error) {
+    state.focusModes = [];
+  }
+}
+
 async function applyZoom() {
   state.zoom = Number(els.zoomSlider.value) || 1;
   els.zoomValue.textContent = `${state.zoom.toFixed(1)}x`;
@@ -295,6 +341,95 @@ async function uploadFiles(files) {
   }
 }
 
+function drawCurrentVideoFrame() {
+  const width = els.video.videoWidth;
+  const height = els.video.videoHeight;
+  els.canvas.width = width;
+  els.canvas.height = height;
+  const ctx = els.canvas.getContext("2d");
+  if (state.hardwareZoom || state.zoom <= 1) {
+    ctx.drawImage(els.video, 0, 0, width, height);
+  } else {
+    const cropWidth = width / state.zoom;
+    const cropHeight = height / state.zoom;
+    const sx = (width - cropWidth) / 2;
+    const sy = (height - cropHeight) / 2;
+    ctx.drawImage(els.video, sx, sy, cropWidth, cropHeight, 0, 0, width, height);
+  }
+}
+
+async function refocusCamera() {
+  const [track] = state.stream?.getVideoTracks() || [];
+  if (track?.applyConstraints && state.focusModes.includes("single-shot")) {
+    try {
+      await track.applyConstraints({ advanced: [{ focusMode: "single-shot" }] });
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      if (state.focusModes.includes("continuous")) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+      }
+      return;
+    } catch (_error) {
+      // Fall through and restart the stream to ask the phone to focus again.
+    }
+  }
+  await startCamera();
+  await new Promise((resolve) => setTimeout(resolve, 900));
+}
+
+async function unusedLegacyCaptureAndUpload(trigger = "button") {
+  const now = Date.now();
+  if (state.isUploading || now - state.lastShotAt < 900) return;
+  if (!activeBatch()) {
+    setStatus("请先创建或选择批次");
+    return;
+  }
+  if (!state.stream || !videoReady()) {
+    setStatus("请先开启相机");
+    return;
+  }
+
+  state.isUploading = true;
+  state.lastShotAt = now;
+  render();
+  try {
+    setStatus("正在检查清晰度...");
+    drawCurrentVideoFrame();
+    setStatus("正在拍照...");
+    // Automatic focus checks must never sit in the shutter path. Refocusing is manual only.
+    const sharpness = Number.POSITIVE_INFINITY;
+    if (false) {
+      setStatus("画面模糊，正在自动重新对焦...");
+      try {
+        await refocusCamera();
+        drawCurrentVideoFrame();
+        sharpness = currentFrameSharpness();
+      } catch (_focusError) {
+        // Keep the original frame and continue; focus assistance must never lock the shutter.
+      }
+      if (sharpness < MIN_SHARPNESS_SCORE) {
+        setStatus("对焦仍不稳定，继续拍照上传...");
+      }
+    }
+
+    const blob = await new Promise((resolve) => els.canvas.toBlob(resolve, "image/jpeg", 0.92));
+    if (!blob) throw new Error("截图失败");
+
+    const filename = `live_${new Date().toISOString().replace(/[:.]/g, "-")}_${trigger}.jpg`;
+    const form = new FormData();
+    form.append("files", blob, filename);
+    setStatus("正在上传...");
+    await api(`/api/batches/${state.activeBatchId}/images`, { method: "POST", body: form });
+    setStatus("上传完成");
+    await loadBatches();
+  } catch (error) {
+    setStatus(error.message === "截图失败" ? "截图失败" : "上传失败");
+    alert(error.message);
+  } finally {
+    state.isUploading = false;
+    render();
+  }
+}
+
 async function captureAndUpload(trigger = "button") {
   const now = Date.now();
   if (state.isUploading || now - state.lastShotAt < 900) return;
@@ -310,41 +445,21 @@ async function captureAndUpload(trigger = "button") {
   state.isUploading = true;
   state.lastShotAt = now;
   render();
-  setStatus("正在上传...");
-
-  const width = els.video.videoWidth;
-  const height = els.video.videoHeight;
-  els.canvas.width = width;
-  els.canvas.height = height;
-  const ctx = els.canvas.getContext("2d");
-  if (state.hardwareZoom || state.zoom <= 1) {
-    ctx.drawImage(els.video, 0, 0, width, height);
-  } else {
-    const cropWidth = width / state.zoom;
-    const cropHeight = height / state.zoom;
-    const sx = (width - cropWidth) / 2;
-    const sy = (height - cropHeight) / 2;
-    ctx.drawImage(els.video, sx, sy, cropWidth, cropHeight, 0, 0, width, height);
-  }
-
-  const blob = await new Promise((resolve) => els.canvas.toBlob(resolve, "image/jpeg", 0.92));
-  if (!blob) {
-    state.isUploading = false;
-    setStatus("截图失败");
-    render();
-    return;
-  }
-
-  const filename = `live_${new Date().toISOString().replace(/[:.]/g, "-")}_${trigger}.jpg`;
-  const form = new FormData();
-  form.append("files", blob, filename);
-
   try {
+    setStatus("正在拍照...");
+    drawCurrentVideoFrame();
+    const blob = await new Promise((resolve) => els.canvas.toBlob(resolve, "image/jpeg", 0.92));
+    if (!blob) throw new Error("截图失败");
+
+    const filename = `live_${new Date().toISOString().replace(/[:.]/g, "-")}_${trigger}.jpg`;
+    const form = new FormData();
+    form.append("files", blob, filename);
+    setStatus("正在上传...");
     await api(`/api/batches/${state.activeBatchId}/images`, { method: "POST", body: form });
     setStatus("上传完成");
     await loadBatches();
   } catch (error) {
-    setStatus("上传失败");
+    setStatus(error.message === "截图失败" ? "截图失败" : "上传失败");
     alert(error.message);
   } finally {
     state.isUploading = false;
@@ -445,6 +560,6 @@ els.createBatchBtn.addEventListener("click", async () => {
   }
 });
 
-setInterval(loadBatches, 3000);
+setInterval(() => loadBatches().catch(() => {}), 1000);
 loadBatches().catch((error) => alert(error.message));
 loadCameraDevices().catch(() => {});
