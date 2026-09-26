@@ -9,6 +9,7 @@ if not defined PYTHON_EXE if exist ".venv\Scripts\python.exe" set "PYTHON_EXE=.v
 if not defined PYTHON_EXE (
     echo [ERROR] Python environment not found.
     echo Run win7\setup.bat first on Windows 7.
+    echo Run windows10\setup.bat first on Windows 10 or Windows 11.
     pause
     exit /b 1
 )

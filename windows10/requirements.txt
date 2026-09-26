@@ -1,0 +1,5 @@
+opencv-python==5.0.0.93
+numpy==2.5.1
+matplotlib==3.11.0
+pillow==12.3.0
+cryptography==49.0.0

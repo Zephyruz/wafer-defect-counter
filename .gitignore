@@ -6,6 +6,9 @@ __pycache__/
 offline_packages/
 win7_offline_bundle/
 win7_deployment_*.zip
+tmp/
+windows10_python-*.exe
+windows10*.zip
 
 # Input photos and generated outputs
 *.jpg

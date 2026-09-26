@@ -1,0 +1,108 @@
+Windows 10/11 64 位安装说明
+=============================
+
+适用电脑
+--------
+本安装包适用于全新的 Windows 10 或 Windows 11 64 位电脑。
+包内已经包含 Python 3.14.6 安装程序和自动网格识别最新版。
+首次配置需要联网下载 Python 依赖。
+
+一、解压安装包
+--------------
+1. 将完整 ZIP 复制到目标电脑本地磁盘。
+2. 解压到纯英文路径，推荐：
+
+   C:\WaferCounter
+
+3. 不要直接在 ZIP 或 U 盘中运行，也尽量不要使用中文、空格或过长路径。
+
+解压后应能看到：
+
+   C:\WaferCounter\windows10\setup.bat
+   C:\WaferCounter\windows10_bundle\
+   C:\WaferCounter\start_app.bat
+   C:\WaferCounter\web_app.py
+   C:\WaferCounter\wafer_defect_counter.py
+   C:\WaferCounter\web_static\
+
+二、连接网络
+------------
+安装前让电脑连接互联网，并连接以后实际使用的公司局域网。
+一键配置会从网络安装 Python 依赖，并根据当前电脑网络地址生成 HTTPS 证书。
+
+三、一键安装
+------------
+双击：
+
+   C:\WaferCounter\windows10\setup.bat
+
+脚本会自动完成：
+
+1. 检查并在需要时安装 Python 3.14.6；
+2. 创建独立的 .venv；
+3. 从网络安装全部程序依赖；
+4. 检查依赖一致性；
+5. 实际加载图像处理组件；
+6. 生成本机 HTTPS 证书。
+
+看到以下提示即安装成功：
+
+   Setup completed successfully.
+
+如果 Python 自动安装失败，可手动双击：
+
+   C:\WaferCounter\windows10_bundle\python-3.14.6-amd64.exe
+
+安装完成后再次运行 windows10\setup.bat。
+
+四、启动程序
+------------
+以后直接双击：
+
+   C:\WaferCounter\start_app.bat
+
+浏览器会打开：
+
+   https://127.0.0.1:8765
+
+第一次访问出现自签名证书警告时，选择“高级”并继续访问。
+如果 Windows 防火墙询问是否允许 Python 通信，请允许“专用网络”访问。
+
+五、PDA 或手机访问
+------------------
+确保 PDA 或手机与电脑连接同一个局域网。
+在电脑 CMD 中执行：
+
+   ipconfig
+
+找到当前网卡的 IPv4 地址，例如 192.168.1.25，然后访问：
+
+   https://192.168.1.25:8765
+   https://192.168.1.25:8765/live-capture
+
+六、数据位置
+------------
+上传原图、结果图和批次记录保存在：
+
+   C:\WaferCounter\web_data
+
+更新程序或备份电脑时必须保留此目录，不要直接删除整个安装目录。
+
+七、常见问题
+------------
+1. 双击启动后没有网页：
+   确认黑色服务窗口仍在运行，然后手动访问 https://127.0.0.1:8765。
+
+2. 提示找不到 .venv：
+   重新运行 windows10\setup.bat。
+
+3. 依赖安装失败：
+   确认电脑可以正常联网，然后重新运行 windows10\setup.bat。
+
+4. PDA 无法访问：
+   确认设备位于同一局域网，并允许 Python 通过 Windows 防火墙的专用网络。
+
+5. 电脑 IP 或现场网络改变：
+   在安装目录运行以下命令重新生成证书：
+
+   .venv\Scripts\python.exe generate_https_cert.py
